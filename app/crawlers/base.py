@@ -22,6 +22,7 @@ class CrawlResult:
     store_url: str
     products: list[RawProduct] = field(default_factory=list)
     errors: list[dict[str, str]] = field(default_factory=list)
+    discovered_count: int = 0
 
     @property
     def success_count(self) -> int:
@@ -104,6 +105,7 @@ class BaseCrawler(ABC):
 
         # 순서를 유지하면서 중복 URL 제거
         product_urls = list(dict.fromkeys(product_urls))
+        result.discovered_count = len(product_urls)
 
         if not product_urls:
             result.errors.append({

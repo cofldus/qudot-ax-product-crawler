@@ -28,6 +28,35 @@ _EXCLUDE_KW = frozenset({
 _CONSUMER_KW = frozenset({"소비자가", "정가", "원가", "정상가"})
 _SALES_KW = frozenset({"판매가", "할인가", "할인판매가", "최종가", "혜택가"})
 
+# 네이버 상품 detail API: salePrice=정가(consumer), discountedSalePrice=판매가(sales)
+_PRICE_KEY_MAP: dict[str, str] = {
+    "salePrice": "consumer_price",
+    "discountedSalePrice": "sales_price",
+    "channelSalePrice": "sales_price",
+    "consumerPrice": "consumer_price",
+    "originalPrice": "consumer_price",
+}
+
+# 오류 페이지 문구 — 이 값이 상품명으로 잡히면 무효 처리한다
+_INVALID_PRODUCT_NAMES: frozenset[str] = frozenset({
+    "상품이 존재하지 않습니다.",
+    "상품이 존재하지 않습니다",
+    "페이지를 찾을 수 없습니다.",
+    "일시적으로 상품 정보를 불러올 수 없습니다.",
+    "판매중지된 상품",
+    "접근할 수 없는 상품",
+})
+
+_NAME_KEYS = frozenset({"name", "productName", "channelProductName"})
+_IMAGE_KEYS = frozenset({"representativeImage", "mainImage", "imageUrl"})
+_PRODUCT_ID_KEYS = frozenset({"productNo", "channelProductNo"})
+
+_API_URL_PATTERN = re.compile(
+    r"products?|channel-products?|category|search", re.IGNORECASE
+)
+
+
+# ── 헬퍼 함수 (단위 테스트 가능) ────────────────────────────────────
 
 def _parse_price(text: str | None) -> int | None:
     """'N원' 패턴만 파싱한다. 퍼센트·순수 숫자는 가격으로 보지 않는다."""
@@ -40,24 +69,26 @@ def _parse_price(text: str | None) -> int | None:
     return val if _PRICE_RANGE[0] <= val <= _PRICE_RANGE[1] else None
 
 
-_INVALID_PRODUCT_NAMES: frozenset[str] = frozenset({
-    "상품이 존재하지 않습니다.",
-    "상품이 존재하지 않습니다",
-    "페이지를 찾을 수 없습니다.",
-    "일시적으로 상품 정보를 불러올 수 없습니다.",
-})
-
-
-def _is_invalid_product_name(name: str) -> bool:
-    """페이지 오류 메시지가 상품명으로 잡혔는지 판단한다."""
-    return name.strip() in _INVALID_PRODUCT_NAMES
-
-
 def _extract_product_id(product_url: str) -> str | None:
-    """URL 마지막 path segment를 product_id로 추출한다. 숫자가 아니면 None."""
+    """URL의 /products/<숫자> 세그먼트에서 product_id를 추출한다.
+
+    숫자로만 구성된 마지막 path segment만 허용한다.
+    """
     path = urlparse(product_url).path.rstrip("/")
     segment = path.split("/")[-1] if path else ""
     return segment if segment.isdigit() else None
+
+
+def _is_invalid_product_name(name: str) -> bool:
+    """네이버 오류 페이지의 문구가 상품명으로 잡혔는지 판단한다."""
+    return name.strip() in _INVALID_PRODUCT_NAMES
+
+
+def _normalize_image_url(url: str) -> str:
+    """//로 시작하는 상대 프로토콜 URL에 https:를 붙인다."""
+    if url.startswith("//"):
+        return f"https:{url}"
+    return url
 
 
 def _store_base_url(store_url: str) -> str:
@@ -71,29 +102,14 @@ def _store_base_url(store_url: str) -> str:
     return f"{base}/{first_segment}" if first_segment else base
 
 
-# ── __NEXT_DATA__ JSON 탐색 헬퍼 ────────────────────────────────────
-
-# 네이버 brand/smart store 상품 detail API 기준:
-#   salePrice          = 정가 (소비자가, 할인 전 가격) → consumer_price
-#   discountedSalePrice = 실제 할인 판매가             → sales_price
-#   channelSalePrice   = 채널 기본 판매가              → sales_price 후보
-_PRICE_KEY_MAP: dict[str, str] = {
-    "salePrice": "consumer_price",
-    "discountedSalePrice": "sales_price",
-    "channelSalePrice": "sales_price",
-    "consumerPrice": "consumer_price",
-    "originalPrice": "consumer_price",
-}
-_NAME_KEYS = frozenset({"name", "productName", "channelProductName"})
-_IMAGE_KEYS = frozenset({"representativeImage", "mainImage", "imageUrl"})
-_PRODUCT_ID_KEYS = frozenset({"productNo", "channelProductNo"})
-
-_API_URL_PATTERN = re.compile(
-    r"products?|channel-products?|category|search", re.IGNORECASE
-)
-
+# ── __NEXT_DATA__ / API 응답 JSON 탐색 헬퍼 ──────────────────────────
 
 def _collect_product_urls_from_json(data: Any, base_url: str) -> list[str]:
+    """JSON에서 productNo/channelProductNo를 재귀 탐색해 상품 URL 목록을 만든다.
+
+    list/product 맥락이 아닌 곳에서 발견된 ID도 수집하지만,
+    DOM URL이 최우선이므로 여기서 만든 URL은 보조용이다.
+    """
     seen: dict[str, None] = {}
 
     def _traverse(obj: Any) -> None:
@@ -118,6 +134,7 @@ def _collect_product_urls_from_json(data: Any, base_url: str) -> list[str]:
 
 
 def _extract_fields_from_json(data: Any) -> dict[str, Any]:
+    """__NEXT_DATA__ JSON에서 이름·가격·이미지·옵션을 재귀 탐색한다."""
     result: dict[str, Any] = {}
 
     def _traverse(obj: Any) -> None:
@@ -134,8 +151,8 @@ def _extract_fields_from_json(data: Any) -> dict[str, Any]:
                         result["image_url"] = v
                     elif isinstance(v, dict):
                         url = v.get("url") or v.get("src")
-                        if url and isinstance(url, str) and url.startswith("http"):
-                            result["image_url"] = url
+                        if url and isinstance(url, str):
+                            result["image_url"] = _normalize_image_url(url)
                 elif k == "optionItems" and isinstance(v, list) and "options" not in result:
                     opts = [
                         item.get("value") or item.get("name", "")
@@ -157,17 +174,17 @@ def _extract_fields_from_json(data: Any) -> dict[str, Any]:
 class NaverStoreCrawler(BaseCrawler):
     """네이버 브랜드스토어 / 스마트스토어 공용 크롤러.
 
-    목록 수집 우선순위:
-      1. __NEXT_DATA__ JSON에서 상품 ID/URL 탐색
-      2. API 응답 인터셉트 (products/category/search 키워드 포함 URL)
-      3. DOM href /products/ 패턴 수집
-      4. 무한 스크롤 후 새 href 반복 수집
+    URL 발견 우선순위:
+      1. DOM에 실제 노출된 a[href*="/products/"] (가장 신뢰도 높음)
+      2. __NEXT_DATA__ JSON에서 상품 ID/URL 탐색
+      3. API 응답 인터셉트 (보조 — 추천/번들 상품 ID 오탐 가능성 있음)
 
     상세 추출 우선순위:
-      1. /n/v2/channels/*/products/<id> API 응답 인터셉트
-      2. __NEXT_DATA__ JSON fallback
-      3. DOM selector fallback
-      4. 페이지 본문 텍스트 가격 fallback
+      1. /n/v2/channels/*/products/<product_id> product detail API
+      2. /products/<product_id>/contents/<content_id>/ contents API
+      3. __NEXT_DATA__ JSON fallback
+      4. DOM selector fallback
+      5. 페이지 본문 텍스트 가격 fallback (가격 전용)
     """
 
     async def discover_product_urls(self, store_url: str) -> list[str]:
@@ -197,7 +214,6 @@ class NaverStoreCrawler(BaseCrawler):
             except Exception:
                 pass
 
-        # asyncio.create_task로 감싸 Playwright event loop와 coroutine 충돌 방지
         def _on_response(response) -> None:
             task = asyncio.create_task(_handle_response(response))
             _pending_tasks.append(task)
@@ -217,10 +233,11 @@ class NaverStoreCrawler(BaseCrawler):
 
         api_urls = list(dict.fromkeys(intercepted_urls))
 
-        # DOM에 노출된 URL을 우선 — API 인터셉트는 추천/번들 상품 보완용
+        # DOM 노출 URL 우선 — API 인터셉트는 추천/번들 상품 보완용
         merged: dict[str, None] = {}
         for u in dom_urls + next_data_urls + api_urls:
             merged[u] = None
+
         return list(merged)
 
     async def _urls_from_next_data(self, page: Page, base_url: str) -> list[str]:
@@ -268,27 +285,35 @@ class NaverStoreCrawler(BaseCrawler):
             raw.crawl_error = "상품 ID 추출 실패"
             return raw
 
-        api_data: dict[str, Any] = {}
+        product_api_data: dict[str, Any] = {}
+        contents_api_data: dict[str, Any] = {}
         _pending_tasks: list[asyncio.Task] = []
 
-        # 상품 detail API 인터셉트: /n/v2/channels/*/products/<id>
-        async def _handle_product_api(response) -> None:
+        async def _handle_apis(response) -> None:
+            if "/n/v2/channels/" not in response.url:
+                return
             resp_url = response.url.split("?")[0]
-            if f"/products/{product_id}" in resp_url and "/n/v2/channels/" in response.url:
-                try:
+            try:
+                if resp_url.endswith(f"/products/{product_id}"):
+                    # 메인 상품 detail API
                     body = await response.json()
                     if isinstance(body, dict):
-                        api_data.update(body)
-                except Exception:
-                    pass
+                        product_api_data.update(body)
+                elif f"/products/{product_id}/contents/" in resp_url:
+                    # 상세설명 contents API
+                    body = await response.json()
+                    if isinstance(body, dict):
+                        contents_api_data.update(body)
+            except Exception:
+                pass
 
-        def _on_product_response(response) -> None:
-            task = asyncio.create_task(_handle_product_api(response))
+        def _on_response(response) -> None:
+            task = asyncio.create_task(_handle_apis(response))
             _pending_tasks.append(task)
 
-        page.on("response", _on_product_response)
+        page.on("response", _on_response)
         ok = await self._goto_and_wait(page, product_url)
-        page.remove_listener("response", _on_product_response)
+        page.remove_listener("response", _on_response)
 
         if _pending_tasks:
             await asyncio.gather(*_pending_tasks, return_exceptions=True)
@@ -297,22 +322,38 @@ class NaverStoreCrawler(BaseCrawler):
             raw.crawl_error = f"페이지 로딩 실패: {product_url}"
             return raw
 
-        # 우선순위 1: API 응답 (가장 신뢰도 높음)
-        if api_data:
-            self._apply_api_fields(raw, api_data)
+        # 우선순위 1: product detail API
+        if product_api_data:
+            self._apply_product_api_fields(raw, product_api_data)
+            raw.raw_evidence["product_api"] = {
+                "matched": True,
+                "keys": list(product_api_data.keys())[:20],
+            }
+        else:
+            raw.raw_evidence["product_api"] = {"matched": False}
 
-        # 우선순위 2: __NEXT_DATA__ JSON fallback
+        # 우선순위 2: contents API (상세설명)
+        if contents_api_data:
+            self._apply_contents_api_fields(raw, contents_api_data)
+            raw.raw_evidence["contents_api"] = {
+                "matched": True,
+                "keys": list(contents_api_data.keys()),
+            }
+        else:
+            raw.raw_evidence["contents_api"] = {"matched": False}
+
+        # 우선순위 3: __NEXT_DATA__ JSON fallback
         if not raw.name or not raw.sales_price:
             fields = await self._fields_from_next_data(page)
             self._apply_json_fields(raw, fields)
 
-        # 우선순위 3: DOM selector fallback
+        # 우선순위 4: DOM selector fallback
         if not raw.name:
             raw.name = await self._dom_name(page)
             if raw.name:
                 raw.raw_evidence["name"] = "DOM selector fallback"
             else:
-                raw.field_errors["name"] = "API/JSON/__NEXT_DATA__/DOM selector 모두 실패"
+                raw.field_errors["name"] = "product API/JSON/__NEXT_DATA__/DOM 모두 실패"
 
         if not raw.sales_price:
             await self._dom_prices(raw, page)
@@ -320,36 +361,39 @@ class NaverStoreCrawler(BaseCrawler):
         if not raw.image_urls:
             img = await self._dom_image(page)
             if img:
-                raw.image_urls = [img]
-                raw.raw_evidence["image_url"] = f"DOM img fallback: {img}"
+                raw.image_urls = [_normalize_image_url(img)]
+                raw.raw_evidence["image_url"] = f"DOM img fallback"
             else:
                 raw.field_errors["image_url"] = "DOM에서 대표 이미지를 찾지 못함"
 
         if not raw.option_texts:
             raw.option_texts = await self._dom_options(page)
             if raw.option_texts:
-                raw.raw_evidence["option_texts"] = f"DOM select/button: {raw.option_texts}"
+                raw.raw_evidence["option_texts"] = "DOM select/button fallback"
             else:
                 raw.field_errors["option_texts"] = (
-                    "DOM에서 옵션 텍스트를 찾지 못함 (단일 옵션 상품일 수 있음)"
+                    "옵션 API/DOM에서 찾지 못함. 단일 옵션 상품일 수 있음"
                 )
 
         if not raw.detail_text:
             raw.detail_text = await self._dom_detail_text(page)
-            if not raw.detail_text:
+            if raw.detail_text:
+                raw.raw_evidence["detail_text"] = "DOM selector fallback"
+            else:
                 raw.field_errors["detail_text"] = (
                     "API textContent 없음 + DOM selector 미매칭 "
-                    "(이미지 기반 상세설명일 수 있음)"
+                    "(이미지 기반 상세페이지로 텍스트 추출 제한)"
                 )
 
         if not raw.category_path:
             raw.category_path = await self._dom_category_path(page)
             if not raw.category_path:
-                raw.field_errors["category_path"] = "breadcrumb/category DOM selector 추출 실패"
+                raw.field_errors["category_path"] = "breadcrumb/category DOM selector 미매칭"
 
-        if not api_data:
+        if not product_api_data:
             raw.is_soldout = await self._dom_soldout(page)
 
+        # 오류 페이지 상품명 필터
         if raw.name and _is_invalid_product_name(raw.name):
             raw.name = None
             raw.crawl_error = "상품 상세 페이지가 존재하지 않거나 비정상 응답"
@@ -358,15 +402,17 @@ class NaverStoreCrawler(BaseCrawler):
 
         return raw
 
-    def _apply_api_fields(self, raw: RawProduct, data: dict[str, Any]) -> None:
-        """product detail API 응답에서 결정적 필드를 추출한다."""
+    def _apply_product_api_fields(self, raw: RawProduct, data: dict[str, Any]) -> None:
+        """product detail API(/n/v2/channels/*/products/<id>) 응답에서 결정적 필드 추출."""
         # 상품명
         name = data.get("name") or data.get("channelProductName") or data.get("dispName")
         if name and isinstance(name, str):
             raw.name = name.strip()
-            raw.raw_evidence["name"] = "product detail API: name"
+            raw.raw_evidence["name"] = "product detail API"
 
-        # 가격 — salePrice = 정가(consumer_price), discountedSalePrice = 실제판매가(sales_price)
+        # 가격
+        # salePrice = 정가/소비자가(consumer_price)
+        # discountedSalePrice = 실제 할인 판매가(sales_price)
         sale_price = data.get("salePrice")
         discounted = data.get("discountedSalePrice")
 
@@ -388,7 +434,9 @@ class NaverStoreCrawler(BaseCrawler):
             raw.consumer_price = sale_int
             raw.consumer_price_text = f"{sale_int:,}원"
         elif raw.sales_price and not raw.consumer_price:
-            raw.field_errors["consumer_price"] = "API에서 정가(salePrice)를 확인하지 못해 null 처리"
+            raw.field_errors["consumer_price"] = (
+                "할인 전 정가와 판매가가 동일하거나 정가 필드가 없어 null 처리"
+            )
 
         raw.raw_evidence["price_api"] = {
             "method": "product detail API",
@@ -397,26 +445,39 @@ class NaverStoreCrawler(BaseCrawler):
             "note": "salePrice=정가(consumer), discountedSalePrice=할인가(sales)",
         }
 
-        # 이미지 — representImage + galleryImages
+        # 이미지 — representImage + galleryImages, 중복 제거, // 보정
         images: list[str] = []
         repr_img = data.get("representImage")
         if isinstance(repr_img, dict):
             url = repr_img.get("url")
-            if url and isinstance(url, str) and url.startswith("http"):
-                images.append(url)
+            if url and isinstance(url, str):
+                images.append(_normalize_image_url(url))
 
         for g in data.get("galleryImages", []):
             if isinstance(g, dict):
                 url = g.get("url")
-                if url and isinstance(url, str) and url.startswith("http") and url not in images:
-                    images.append(url)
+                if url and isinstance(url, str):
+                    url = _normalize_image_url(url)
+                    if url not in images:
+                        images.append(url)
+
+        # DOM img fallback: productImages 키도 시도
+        if not images:
+            for img in data.get("productImages", []):
+                if isinstance(img, dict):
+                    url = img.get("url") or img.get("src")
+                    if url and isinstance(url, str):
+                        url = _normalize_image_url(url)
+                        if url not in images:
+                            images.append(url)
 
         if images:
             raw.image_urls = images
             raw.raw_evidence["image_url"] = f"product detail API: {len(images)}개"
 
         # 옵션 — optionCombinations 우선, fallback으로 simpleOptions/textOptions
-        opt_texts: list[str] = []
+        opt_set: dict[str, None] = {}
+
         for combo in data.get("optionCombinations", []):
             if isinstance(combo, dict):
                 parts = [
@@ -426,17 +487,17 @@ class NaverStoreCrawler(BaseCrawler):
                 ]
                 parts = [p for p in parts if p and isinstance(p, str)]
                 if parts:
-                    opt_texts.append(" / ".join(parts))
+                    opt_set[" / ".join(parts)] = None
 
-        if not opt_texts:
+        if not opt_set:
             for item in data.get("simpleOptions", []) + data.get("textOptions", []):
                 if isinstance(item, dict):
                     val = item.get("value") or item.get("name")
                     if val:
-                        opt_texts.append(str(val))
+                        opt_set[str(val)] = None
 
-        if opt_texts:
-            raw.option_texts = opt_texts
+        if opt_set:
+            raw.option_texts = list(opt_set)
             raw.raw_evidence["option_texts"] = "product detail API: optionCombinations"
 
         # 품절 여부
@@ -444,33 +505,45 @@ class NaverStoreCrawler(BaseCrawler):
         if soldout is not None:
             raw.is_soldout = bool(soldout)
 
-        # 상세 설명 — contents API의 textContent 또는 renderContent
-        # (contents 엔드포인트: /products/<id>/contents/<cid>/ 는 동일 인터셉터에서 포착됨)
-        text_content = data.get("textContent")
-        render_content = data.get("renderContent")
-        if isinstance(text_content, str) and len(text_content.strip()) > 10:
-            raw.detail_text = text_content.strip()
-            raw.raw_evidence["detail_text"] = "product contents API: textContent"
-        elif isinstance(render_content, str) and render_content.strip():
-            clean = re.sub(r"<[^>]+>", " ", render_content)
-            clean = re.sub(r"\s+", " ", clean).strip()
-            if len(clean) > 10:
-                raw.detail_text = clean
-                raw.raw_evidence["detail_text"] = "product contents API: renderContent (HTML stripped)"
-
-        # 카테고리 — category1Name > category2Name > category3Name 계층 구조
+        # 카테고리 — category1~4Name 계층 구조
         category = data.get("category")
         if isinstance(category, dict):
             cat_parts = [
                 category.get("category1Name"),
                 category.get("category2Name"),
-                category.get("category3Name") or category.get("categoryName"),
+                category.get("category3Name"),
+                category.get("category4Name"),
             ]
             cat_parts = [p for p in cat_parts if p and isinstance(p, str)]
             if cat_parts:
-                # 동일 이름 중복 제거 (category3Name == categoryName인 경우)
                 raw.category_path = " > ".join(dict.fromkeys(cat_parts))
                 raw.raw_evidence["category_path"] = "product detail API: category hierarchy"
+
+    def _apply_contents_api_fields(self, raw: RawProduct, data: dict[str, Any]) -> None:
+        """contents API(/products/<id>/contents/<cid>/) 응답에서 상세설명 추출."""
+        text_content = data.get("textContent")
+        render_content = data.get("renderContent")
+
+        if isinstance(text_content, str) and len(text_content.strip()) > 10:
+            raw.detail_text = text_content.strip()
+            raw.raw_evidence["detail_text"] = (
+                f"contents API: textContent (len={len(text_content.strip())})"
+            )
+            return
+
+        if isinstance(render_content, str) and render_content.strip():
+            clean = re.sub(r"<[^>]+>", " ", render_content)
+            clean = re.sub(r"\s+", " ", clean).strip()
+            if len(clean) > 10:
+                raw.detail_text = clean
+                raw.raw_evidence["detail_text"] = (
+                    f"contents API: renderContent HTML stripped "
+                    f"(len={len(clean)})"
+                )
+            else:
+                raw.field_errors["detail_text"] = (
+                    "이미지 기반 상세페이지로 텍스트 추출 제한"
+                )
 
     async def _fields_from_next_data(self, page: Page) -> dict[str, Any]:
         try:
@@ -496,7 +569,6 @@ class NaverStoreCrawler(BaseCrawler):
                 "method": "__NEXT_DATA__ recursive key extraction",
                 "sales_price": fields.get("sales_price"),
                 "consumer_price": fields.get("consumer_price"),
-                "note": "JSON key map 기반 결정적 가격 추출",
             }
 
         if fields.get("sales_price") and not raw.sales_price:
@@ -508,19 +580,15 @@ class NaverStoreCrawler(BaseCrawler):
 
         if fields.get("image_url") and not raw.image_urls:
             raw.image_urls = [fields["image_url"]]
-            raw.raw_evidence["image_url"] = (
-                f"__NEXT_DATA__ representativeImage: {fields['image_url']}"
-            )
+            raw.raw_evidence["image_url"] = "__NEXT_DATA__ representativeImage"
+
         if fields.get("options") and not raw.option_texts:
             raw.option_texts = fields["options"]
-            raw.raw_evidence["option_texts"] = (
-                f"__NEXT_DATA__ optionItems: {fields['options']}"
-            )
+            raw.raw_evidence["option_texts"] = "__NEXT_DATA__ optionItems"
 
     # ── DOM selector fallback 메서드들 ──────────────────────────────
 
     async def _dom_name(self, page: Page) -> str | None:
-        # CSS selector 기반 시도
         selectors = [
             "._3oDjSvLwozF4 span",
             "[class*='productTitle'] span",
@@ -539,7 +607,7 @@ class NaverStoreCrawler(BaseCrawler):
             except Exception:
                 continue
 
-        # h3 중 가장 긴 텍스트 — 상품명은 대체로 h3에 위치
+        # h3 중 가장 긴 텍스트 (상품명은 대체로 h3에 위치)
         try:
             h3_texts: list[str] = await page.evaluate(
                 "() => Array.from(document.querySelectorAll('h3'))"
@@ -672,12 +740,12 @@ class NaverStoreCrawler(BaseCrawler):
             valid.append(entry)
 
         # 동일 금액 중복 제거 — 역할 힌트 있는 항목 우선
-        seen: dict[int, dict[str, Any]] = {}
+        seen_val: dict[int, dict[str, Any]] = {}
         for c in valid:
             amt = c["value"]
-            if amt not in seen or (c["role_hint"] and not seen[amt]["role_hint"]):
-                seen[amt] = c
-        deduped = list(seen.values())
+            if amt not in seen_val or (c["role_hint"] and not seen_val[amt]["role_hint"]):
+                seen_val[amt] = c
+        deduped = list(seen_val.values())
 
         consumer_price: int | None = None
         sales_price: int | None = None
@@ -698,15 +766,12 @@ class NaverStoreCrawler(BaseCrawler):
                     consumer_price = amounts[-1]
                     sales_price = amounts[0]
                 elif amounts:
-                    # 단일 가격 → sales_price로 처리
                     sales_price = amounts[0]
             elif sales_price and not consumer_price and unclassified:
                 bigger = [v for v in unclassified if v > sales_price]
                 if bigger:
                     consumer_price = max(bigger)
-            # consumer_only 케이스: 억지 변환하지 않고 실패 사유를 남긴다
 
-        # 정합성 보정
         if consumer_price and sales_price:
             if consumer_price == sales_price:
                 consumer_price = None
@@ -719,14 +784,12 @@ class NaverStoreCrawler(BaseCrawler):
 
         raw.raw_evidence["price_fallback"] = {
             "method": "DOM text price fallback",
-            "candidates": deduped,
-            "excluded_candidates": excluded,
+            "candidate_count": len(deduped),
+            "excluded_count": len(excluded),
             "selected_consumer_price": consumer_price,
             "selected_sales_price": sales_price,
-            "note": "본문 가격 후보 중 배송비/쿠폰/포인트 context 제외 후 추정",
         }
 
-        # 기존에 추출된 값이 있는 경우 덮어쓰지 않는다
         if sales_price and not raw.sales_price:
             raw.sales_price = sales_price
             raw.sales_price_text = f"{sales_price:,}원"
@@ -737,7 +800,9 @@ class NaverStoreCrawler(BaseCrawler):
             raw.consumer_price = consumer_price
             raw.consumer_price_text = f"{consumer_price:,}원"
         elif not consumer_price and not raw.consumer_price:
-            raw.field_errors["consumer_price"] = "정가/소비자가 영역을 찾지 못해 null 처리"
+            raw.field_errors["consumer_price"] = (
+                "할인 전 정가와 판매가가 동일하거나 정가 필드가 없어 null 처리"
+            )
 
     async def _dom_image(self, page: Page) -> str | None:
         selectors = [
@@ -751,7 +816,7 @@ class NaverStoreCrawler(BaseCrawler):
                 el = await page.query_selector(sel)
                 if el:
                     src = await el.get_attribute("src")
-                    if src and src.startswith("http"):
+                    if src and (src.startswith("http") or src.startswith("//")):
                         return src
             except Exception:
                 continue
@@ -770,7 +835,7 @@ class NaverStoreCrawler(BaseCrawler):
                 }
             """)
             if opts:
-                return opts[:20]
+                return list(dict.fromkeys(opts))[:20]
         except Exception:
             pass
         try:
@@ -779,7 +844,7 @@ class NaverStoreCrawler(BaseCrawler):
                           .map(b => b.textContent.trim())
                           .filter(t => t.length > 0)
             """)
-            return btns[:20]
+            return list(dict.fromkeys(btns))[:20]
         except Exception:
             return []
 
@@ -833,7 +898,9 @@ def _validate_and_fix_prices(raw: RawProduct) -> None:
         if cp == sp:
             raw.consumer_price = None
             raw.consumer_price_text = None
-            raw.field_errors["consumer_price"] = "정가/소비자가 영역을 찾지 못해 null 처리"
+            raw.field_errors["consumer_price"] = (
+                "할인 전 정가와 판매가가 동일하거나 정가 필드가 없어 null 처리"
+            )
         elif sp > cp:
             raw.field_errors["price_consistency"] = (
                 f"DOM selector sales({sp}) > consumer({cp}) "
