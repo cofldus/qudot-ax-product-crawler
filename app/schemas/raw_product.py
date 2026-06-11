@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Any
 from zoneinfo import ZoneInfo
 
 _KST = ZoneInfo("Asia/Seoul")
@@ -45,9 +46,9 @@ class RawProduct:
     crawled_at: datetime = field(default_factory=lambda: datetime.now(_KST))
 
     # 원본 근거 — 각 필드를 어디서 추출했는지 기록
+    # 문자열 또는 중첩 dict/list로 상세 evidence를 담을 수 있다.
     # 최종 PartnerProductCreateInput.raw_evidence로 그대로 전달된다.
-    # 예: {"name": "h1 상품명 영역에서 추출", "sales_price": "판매가 원본: 21,500원"}
-    raw_evidence: dict[str, str] = field(default_factory=dict)
+    raw_evidence: dict[str, Any] = field(default_factory=dict)
 
     # 개별 필드 추출 실패 사유 (key: 필드명, value: 실패 이유)
     field_errors: dict[str, str] = field(default_factory=dict)
