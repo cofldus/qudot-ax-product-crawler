@@ -1,0 +1,843 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import re
+from typing import Any
+from urllib.parse import urlparse
+
+from playwright.async_api import Page
+
+from app.crawlers.base import BaseCrawler
+from app.schemas.raw_product import RawProduct
+
+
+# ── 가격 파싱 상수 ──────────────────────────────────────────────────
+
+# "원"이 붙은 숫자만 대상. 퍼센트·옵션 개수·리뷰 수를 가격으로 오인하지 않는다.
+_PRICE_TEXT_RE = re.compile(r"(\d{1,3}(?:,\d{3})+|\d{4,})\s*원")
+_PRICE_RANGE = (1_000, 10_000_000)
+
+# 가격 주변 context에서 아래 키워드가 발견되면 이 가격은 제외
+# "혜택가"는 sales_price role hint로 사용되므로 "혜택"은 제외 목록에서 뺀다
+_EXCLUDE_KW = frozenset({
+    "배송비", "무료배송", "쿠폰", "적립", "포인트",
+    "이상 구매", "구매 시", "리뷰", "톡톡", "최대",
+})
+
+_CONSUMER_KW = frozenset({"소비자가", "정가", "원가", "정상가"})
+_SALES_KW = frozenset({"판매가", "할인가", "할인판매가", "최종가", "혜택가"})
+
+
+def _parse_price(text: str | None) -> int | None:
+    """'N원' 패턴만 파싱한다. 퍼센트·순수 숫자는 가격으로 보지 않는다."""
+    if not text:
+        return None
+    m = _PRICE_TEXT_RE.search(str(text))
+    if not m:
+        return None
+    val = int(m.group(1).replace(",", ""))
+    return val if _PRICE_RANGE[0] <= val <= _PRICE_RANGE[1] else None
+
+
+_INVALID_PRODUCT_NAMES: frozenset[str] = frozenset({
+    "상품이 존재하지 않습니다.",
+    "상품이 존재하지 않습니다",
+    "페이지를 찾을 수 없습니다.",
+    "일시적으로 상품 정보를 불러올 수 없습니다.",
+})
+
+
+def _is_invalid_product_name(name: str) -> bool:
+    """페이지 오류 메시지가 상품명으로 잡혔는지 판단한다."""
+    return name.strip() in _INVALID_PRODUCT_NAMES
+
+
+def _extract_product_id(product_url: str) -> str | None:
+    """URL 마지막 path segment를 product_id로 추출한다. 숫자가 아니면 None."""
+    path = urlparse(product_url).path.rstrip("/")
+    segment = path.split("/")[-1] if path else ""
+    return segment if segment.isdigit() else None
+
+
+def _store_base_url(store_url: str) -> str:
+    """scheme + netloc + 첫 번째 path segment만 추출한다.
+
+    예) https://brand.naver.com/kefii/category/123 → https://brand.naver.com/kefii
+    """
+    parsed = urlparse(store_url)
+    first_segment = parsed.path.strip("/").split("/")[0]
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    return f"{base}/{first_segment}" if first_segment else base
+
+
+# ── __NEXT_DATA__ JSON 탐색 헬퍼 ────────────────────────────────────
+
+# 네이버 brand/smart store 상품 detail API 기준:
+#   salePrice          = 정가 (소비자가, 할인 전 가격) → consumer_price
+#   discountedSalePrice = 실제 할인 판매가             → sales_price
+#   channelSalePrice   = 채널 기본 판매가              → sales_price 후보
+_PRICE_KEY_MAP: dict[str, str] = {
+    "salePrice": "consumer_price",
+    "discountedSalePrice": "sales_price",
+    "channelSalePrice": "sales_price",
+    "consumerPrice": "consumer_price",
+    "originalPrice": "consumer_price",
+}
+_NAME_KEYS = frozenset({"name", "productName", "channelProductName"})
+_IMAGE_KEYS = frozenset({"representativeImage", "mainImage", "imageUrl"})
+_PRODUCT_ID_KEYS = frozenset({"productNo", "channelProductNo"})
+
+_API_URL_PATTERN = re.compile(
+    r"products?|channel-products?|category|search", re.IGNORECASE
+)
+
+
+def _collect_product_urls_from_json(data: Any, base_url: str) -> list[str]:
+    seen: dict[str, None] = {}
+
+    def _traverse(obj: Any) -> None:
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if (
+                    k in _PRODUCT_ID_KEYS
+                    and isinstance(v, (int, str))
+                    and str(v).isdigit()
+                ):
+                    seen[f"{base_url}/products/{v}"] = None
+                elif k in ("productUrl", "detailUrl") and isinstance(v, str) and "products/" in v:
+                    url = v if v.startswith("http") else f"https:{v}"
+                    seen[url.split("?")[0]] = None
+                _traverse(v)
+        elif isinstance(obj, list):
+            for item in obj:
+                _traverse(item)
+
+    _traverse(data)
+    return list(seen)
+
+
+def _extract_fields_from_json(data: Any) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+
+    def _traverse(obj: Any) -> None:
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if k in _NAME_KEYS and isinstance(v, str) and v and "name" not in result:
+                    result["name"] = v
+                elif k in _PRICE_KEY_MAP and isinstance(v, (int, float)) and v > 0:
+                    target = _PRICE_KEY_MAP[k]
+                    if target not in result:
+                        result[target] = int(v)
+                elif k in _IMAGE_KEYS and "image_url" not in result:
+                    if isinstance(v, str) and v.startswith("http"):
+                        result["image_url"] = v
+                    elif isinstance(v, dict):
+                        url = v.get("url") or v.get("src")
+                        if url and isinstance(url, str) and url.startswith("http"):
+                            result["image_url"] = url
+                elif k == "optionItems" and isinstance(v, list) and "options" not in result:
+                    opts = [
+                        item.get("value") or item.get("name", "")
+                        for item in v
+                        if isinstance(item, dict)
+                    ]
+                    result["options"] = [o for o in opts if o]
+                _traverse(v)
+        elif isinstance(obj, list):
+            for item in obj:
+                _traverse(item)
+
+    _traverse(data)
+    return result
+
+
+# ── 크롤러 ──────────────────────────────────────────────────────────
+
+class NaverStoreCrawler(BaseCrawler):
+    """네이버 브랜드스토어 / 스마트스토어 공용 크롤러.
+
+    목록 수집 우선순위:
+      1. __NEXT_DATA__ JSON에서 상품 ID/URL 탐색
+      2. API 응답 인터셉트 (products/category/search 키워드 포함 URL)
+      3. DOM href /products/ 패턴 수집
+      4. 무한 스크롤 후 새 href 반복 수집
+
+    상세 추출 우선순위:
+      1. /n/v2/channels/*/products/<id> API 응답 인터셉트
+      2. __NEXT_DATA__ JSON fallback
+      3. DOM selector fallback
+      4. 페이지 본문 텍스트 가격 fallback
+    """
+
+    async def discover_product_urls(self, store_url: str) -> list[str]:
+        assert self._context is not None
+        page = await self._context.new_page()
+        try:
+            return await self._discover(page, store_url)
+        finally:
+            await page.close()
+
+    async def _discover(self, page: Page, store_url: str) -> list[str]:
+        base_url = _store_base_url(store_url)
+        intercepted_urls: list[str] = []
+        _pending_tasks: list[asyncio.Task] = []
+
+        async def _handle_response(response) -> None:
+            if not _API_URL_PATTERN.search(response.url):
+                return
+            content_type = response.headers.get("content-type", "")
+            if "json" not in content_type and "javascript" not in content_type:
+                return
+            try:
+                body = await response.json()
+                intercepted_urls.extend(
+                    _collect_product_urls_from_json(body, base_url)
+                )
+            except Exception:
+                pass
+
+        # asyncio.create_task로 감싸 Playwright event loop와 coroutine 충돌 방지
+        def _on_response(response) -> None:
+            task = asyncio.create_task(_handle_response(response))
+            _pending_tasks.append(task)
+
+        page.on("response", _on_response)
+        ok = await self._goto_and_wait(page, store_url)
+
+        next_data_urls = await self._urls_from_next_data(page, base_url)
+        dom_urls = await self._urls_from_dom_scroll(page, base_url)
+
+        page.remove_listener("response", _on_response)
+        if _pending_tasks:
+            await asyncio.gather(*_pending_tasks, return_exceptions=True)
+
+        if not ok:
+            return []
+
+        api_urls = list(dict.fromkeys(intercepted_urls))
+
+        # DOM에 노출된 URL을 우선 — API 인터셉트는 추천/번들 상품 보완용
+        merged: dict[str, None] = {}
+        for u in dom_urls + next_data_urls + api_urls:
+            merged[u] = None
+        return list(merged)
+
+    async def _urls_from_next_data(self, page: Page, base_url: str) -> list[str]:
+        try:
+            text: str | None = await page.evaluate(
+                "() => { const el = document.getElementById('__NEXT_DATA__'); "
+                "return el ? el.textContent : null; }"
+            )
+            if not text:
+                return []
+            return _collect_product_urls_from_json(json.loads(text), base_url)
+        except Exception:
+            return []
+
+    async def _urls_from_dom_scroll(self, page: Page, base_url: str) -> list[str]:
+        seen: dict[str, None] = {}
+        max_scrolls = 8
+
+        for _ in range(max_scrolls):
+            hrefs: list[str] = await page.evaluate(
+                "() => Array.from(document.querySelectorAll('a[href*=\"/products/\"]'))"
+                ".map(a => a.href)"
+            )
+            prev_count = len(seen)
+            for href in hrefs:
+                clean = href.split("?")[0]
+                if "/products/" in clean:
+                    seen[clean] = None
+
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await page.wait_for_timeout(1200)
+
+            if len(seen) == prev_count:
+                break
+
+        return list(seen)
+
+    # ── 상세 추출 ────────────────────────────────────────────────────
+
+    async def extract_product_detail(self, page: Page, product_url: str) -> RawProduct:
+        raw = RawProduct(source_url=product_url)
+
+        product_id = _extract_product_id(product_url)
+        if not product_id:
+            raw.crawl_error = "상품 ID 추출 실패"
+            return raw
+
+        api_data: dict[str, Any] = {}
+        _pending_tasks: list[asyncio.Task] = []
+
+        # 상품 detail API 인터셉트: /n/v2/channels/*/products/<id>
+        async def _handle_product_api(response) -> None:
+            resp_url = response.url.split("?")[0]
+            if f"/products/{product_id}" in resp_url and "/n/v2/channels/" in response.url:
+                try:
+                    body = await response.json()
+                    if isinstance(body, dict):
+                        api_data.update(body)
+                except Exception:
+                    pass
+
+        def _on_product_response(response) -> None:
+            task = asyncio.create_task(_handle_product_api(response))
+            _pending_tasks.append(task)
+
+        page.on("response", _on_product_response)
+        ok = await self._goto_and_wait(page, product_url)
+        page.remove_listener("response", _on_product_response)
+
+        if _pending_tasks:
+            await asyncio.gather(*_pending_tasks, return_exceptions=True)
+
+        if not ok:
+            raw.crawl_error = f"페이지 로딩 실패: {product_url}"
+            return raw
+
+        # 우선순위 1: API 응답 (가장 신뢰도 높음)
+        if api_data:
+            self._apply_api_fields(raw, api_data)
+
+        # 우선순위 2: __NEXT_DATA__ JSON fallback
+        if not raw.name or not raw.sales_price:
+            fields = await self._fields_from_next_data(page)
+            self._apply_json_fields(raw, fields)
+
+        # 우선순위 3: DOM selector fallback
+        if not raw.name:
+            raw.name = await self._dom_name(page)
+            if raw.name:
+                raw.raw_evidence["name"] = "DOM selector fallback"
+            else:
+                raw.field_errors["name"] = "API/JSON/__NEXT_DATA__/DOM selector 모두 실패"
+
+        if not raw.sales_price:
+            await self._dom_prices(raw, page)
+
+        if not raw.image_urls:
+            img = await self._dom_image(page)
+            if img:
+                raw.image_urls = [img]
+                raw.raw_evidence["image_url"] = f"DOM img fallback: {img}"
+            else:
+                raw.field_errors["image_url"] = "DOM에서 대표 이미지를 찾지 못함"
+
+        if not raw.option_texts:
+            raw.option_texts = await self._dom_options(page)
+            if raw.option_texts:
+                raw.raw_evidence["option_texts"] = f"DOM select/button: {raw.option_texts}"
+            else:
+                raw.field_errors["option_texts"] = (
+                    "DOM에서 옵션 텍스트를 찾지 못함 (단일 옵션 상품일 수 있음)"
+                )
+
+        if not raw.detail_text:
+            raw.detail_text = await self._dom_detail_text(page)
+            if not raw.detail_text:
+                raw.field_errors["detail_text"] = (
+                    "API textContent 없음 + DOM selector 미매칭 "
+                    "(이미지 기반 상세설명일 수 있음)"
+                )
+
+        if not raw.category_path:
+            raw.category_path = await self._dom_category_path(page)
+            if not raw.category_path:
+                raw.field_errors["category_path"] = "breadcrumb/category DOM selector 추출 실패"
+
+        if not api_data:
+            raw.is_soldout = await self._dom_soldout(page)
+
+        if raw.name and _is_invalid_product_name(raw.name):
+            raw.name = None
+            raw.crawl_error = "상품 상세 페이지가 존재하지 않거나 비정상 응답"
+        elif not raw.name:
+            raw.crawl_error = "상품명 추출 실패"
+
+        return raw
+
+    def _apply_api_fields(self, raw: RawProduct, data: dict[str, Any]) -> None:
+        """product detail API 응답에서 결정적 필드를 추출한다."""
+        # 상품명
+        name = data.get("name") or data.get("channelProductName") or data.get("dispName")
+        if name and isinstance(name, str):
+            raw.name = name.strip()
+            raw.raw_evidence["name"] = "product detail API: name"
+
+        # 가격 — salePrice = 정가(consumer_price), discountedSalePrice = 실제판매가(sales_price)
+        sale_price = data.get("salePrice")
+        discounted = data.get("discountedSalePrice")
+
+        sale_int = int(sale_price) if isinstance(sale_price, (int, float)) and sale_price > 0 else None
+        disc_int = int(discounted) if isinstance(discounted, (int, float)) and discounted > 0 else None
+
+        if disc_int and _PRICE_RANGE[0] <= disc_int <= _PRICE_RANGE[1]:
+            raw.sales_price = disc_int
+            raw.sales_price_text = f"{disc_int:,}원"
+        elif sale_int and _PRICE_RANGE[0] <= sale_int <= _PRICE_RANGE[1]:
+            raw.sales_price = sale_int
+            raw.sales_price_text = f"{sale_int:,}원"
+
+        if (
+            sale_int and disc_int
+            and sale_int != disc_int
+            and _PRICE_RANGE[0] <= sale_int <= _PRICE_RANGE[1]
+        ):
+            raw.consumer_price = sale_int
+            raw.consumer_price_text = f"{sale_int:,}원"
+        elif raw.sales_price and not raw.consumer_price:
+            raw.field_errors["consumer_price"] = "API에서 정가(salePrice)를 확인하지 못해 null 처리"
+
+        raw.raw_evidence["price_api"] = {
+            "method": "product detail API",
+            "salePrice": sale_price,
+            "discountedSalePrice": discounted,
+            "note": "salePrice=정가(consumer), discountedSalePrice=할인가(sales)",
+        }
+
+        # 이미지 — representImage + galleryImages
+        images: list[str] = []
+        repr_img = data.get("representImage")
+        if isinstance(repr_img, dict):
+            url = repr_img.get("url")
+            if url and isinstance(url, str) and url.startswith("http"):
+                images.append(url)
+
+        for g in data.get("galleryImages", []):
+            if isinstance(g, dict):
+                url = g.get("url")
+                if url and isinstance(url, str) and url.startswith("http") and url not in images:
+                    images.append(url)
+
+        if images:
+            raw.image_urls = images
+            raw.raw_evidence["image_url"] = f"product detail API: {len(images)}개"
+
+        # 옵션 — optionCombinations 우선, fallback으로 simpleOptions/textOptions
+        opt_texts: list[str] = []
+        for combo in data.get("optionCombinations", []):
+            if isinstance(combo, dict):
+                parts = [
+                    combo.get("optionName1"),
+                    combo.get("optionName2"),
+                    combo.get("optionName3"),
+                ]
+                parts = [p for p in parts if p and isinstance(p, str)]
+                if parts:
+                    opt_texts.append(" / ".join(parts))
+
+        if not opt_texts:
+            for item in data.get("simpleOptions", []) + data.get("textOptions", []):
+                if isinstance(item, dict):
+                    val = item.get("value") or item.get("name")
+                    if val:
+                        opt_texts.append(str(val))
+
+        if opt_texts:
+            raw.option_texts = opt_texts
+            raw.raw_evidence["option_texts"] = "product detail API: optionCombinations"
+
+        # 품절 여부
+        soldout = data.get("soldout")
+        if soldout is not None:
+            raw.is_soldout = bool(soldout)
+
+        # 상세 설명 — contents API의 textContent 또는 renderContent
+        # (contents 엔드포인트: /products/<id>/contents/<cid>/ 는 동일 인터셉터에서 포착됨)
+        text_content = data.get("textContent")
+        render_content = data.get("renderContent")
+        if isinstance(text_content, str) and len(text_content.strip()) > 10:
+            raw.detail_text = text_content.strip()
+            raw.raw_evidence["detail_text"] = "product contents API: textContent"
+        elif isinstance(render_content, str) and render_content.strip():
+            clean = re.sub(r"<[^>]+>", " ", render_content)
+            clean = re.sub(r"\s+", " ", clean).strip()
+            if len(clean) > 10:
+                raw.detail_text = clean
+                raw.raw_evidence["detail_text"] = "product contents API: renderContent (HTML stripped)"
+
+        # 카테고리 — category1Name > category2Name > category3Name 계층 구조
+        category = data.get("category")
+        if isinstance(category, dict):
+            cat_parts = [
+                category.get("category1Name"),
+                category.get("category2Name"),
+                category.get("category3Name") or category.get("categoryName"),
+            ]
+            cat_parts = [p for p in cat_parts if p and isinstance(p, str)]
+            if cat_parts:
+                # 동일 이름 중복 제거 (category3Name == categoryName인 경우)
+                raw.category_path = " > ".join(dict.fromkeys(cat_parts))
+                raw.raw_evidence["category_path"] = "product detail API: category hierarchy"
+
+    async def _fields_from_next_data(self, page: Page) -> dict[str, Any]:
+        try:
+            text: str | None = await page.evaluate(
+                "() => { const el = document.getElementById('__NEXT_DATA__'); "
+                "return el ? el.textContent : null; }"
+            )
+            if not text:
+                return {}
+            return _extract_fields_from_json(json.loads(text))
+        except Exception:
+            return {}
+
+    def _apply_json_fields(self, raw: RawProduct, fields: dict[str, Any]) -> None:
+        """__NEXT_DATA__ 기반 추출 결과를 raw에 병합한다. 기존 값을 덮어쓰지 않는다."""
+        if fields.get("name") and not raw.name:
+            raw.name = fields["name"]
+            raw.raw_evidence["name"] = "__NEXT_DATA__에서 추출"
+
+        has_price = fields.get("sales_price") or fields.get("consumer_price")
+        if has_price:
+            raw.raw_evidence["price_json"] = {
+                "method": "__NEXT_DATA__ recursive key extraction",
+                "sales_price": fields.get("sales_price"),
+                "consumer_price": fields.get("consumer_price"),
+                "note": "JSON key map 기반 결정적 가격 추출",
+            }
+
+        if fields.get("sales_price") and not raw.sales_price:
+            raw.sales_price = fields["sales_price"]
+            raw.sales_price_text = str(fields["sales_price"])
+        if fields.get("consumer_price") and not raw.consumer_price:
+            raw.consumer_price = fields["consumer_price"]
+            raw.consumer_price_text = str(fields["consumer_price"])
+
+        if fields.get("image_url") and not raw.image_urls:
+            raw.image_urls = [fields["image_url"]]
+            raw.raw_evidence["image_url"] = (
+                f"__NEXT_DATA__ representativeImage: {fields['image_url']}"
+            )
+        if fields.get("options") and not raw.option_texts:
+            raw.option_texts = fields["options"]
+            raw.raw_evidence["option_texts"] = (
+                f"__NEXT_DATA__ optionItems: {fields['options']}"
+            )
+
+    # ── DOM selector fallback 메서드들 ──────────────────────────────
+
+    async def _dom_name(self, page: Page) -> str | None:
+        # CSS selector 기반 시도
+        selectors = [
+            "._3oDjSvLwozF4 span",
+            "[class*='productTitle'] span",
+            "[class*='_2-I30XS1lA'] span",
+            "h3._2-I30XS1lA",
+            ".product_title",
+            "h2.product-name",
+        ]
+        for sel in selectors:
+            try:
+                el = await page.query_selector(sel)
+                if el:
+                    text = (await el.inner_text()).strip()
+                    if len(text) > 1:
+                        return text
+            except Exception:
+                continue
+
+        # h3 중 가장 긴 텍스트 — 상품명은 대체로 h3에 위치
+        try:
+            h3_texts: list[str] = await page.evaluate(
+                "() => Array.from(document.querySelectorAll('h3'))"
+                ".map(el => el.textContent.trim())"
+                ".filter(t => t.length > 5)"
+            )
+            if h3_texts:
+                return max(h3_texts, key=len)
+        except Exception:
+            pass
+
+        # 페이지 타이틀 fallback — "상품명 : 스토어명" 패턴
+        try:
+            title = await page.title()
+            if " : " in title:
+                candidate = title.split(" : ")[0].strip()
+                if len(candidate) > 2:
+                    return candidate
+            elif title and len(title) > 2:
+                return title
+        except Exception:
+            pass
+
+        return None
+
+    async def _dom_prices(self, raw: RawProduct, page: Page) -> None:
+        """구조화 selector로 가격 추출. 실패 시 본문 텍스트 fallback."""
+        dom_evidence: dict[str, Any] = {"method": "DOM selector price extraction"}
+
+        sale_selectors = [
+            ("[class*='salePrice'] strong", "salePrice.strong"),
+            ("[class*='discountedSalePrice'] strong", "discountedSalePrice.strong"),
+            ("[class*='finalPrice'] strong", "finalPrice.strong"),
+            ("[class*='price_now']", "price_now"),
+            ("[class*='price_num']", "price_num"),
+            ("[class*='_1LY7DqCnwR']", "_1LY7DqCnwR"),
+            ("em[class*='price']", "em.price"),
+            ("[class*='price'] strong", "price.strong"),
+        ]
+        for sel, label in sale_selectors:
+            try:
+                el = await page.query_selector(sel)
+                if el:
+                    text = (await el.inner_text()).strip()
+                    price = _parse_price(text)
+                    if price:
+                        raw.sales_price = price
+                        raw.sales_price_text = text
+                        dom_evidence["sales_selector"] = label
+                        dom_evidence["sales_price_text"] = text
+                        break
+            except Exception:
+                continue
+
+        consumer_selectors = [
+            ("[class*='consumerPrice'] span", "consumerPrice.span"),
+            ("[class*='originalPrice'] span", "originalPrice.span"),
+            ("[class*='regularPrice'] span", "regularPrice.span"),
+            ("[class*='_3p6oNb'] span", "_3p6oNb.span"),
+            (".price_cancel", "price_cancel"),
+            ("del", "del"),
+            ("s", "s"),
+        ]
+        for sel, label in consumer_selectors:
+            try:
+                el = await page.query_selector(sel)
+                if el:
+                    text = (await el.inner_text()).strip()
+                    price = _parse_price(text)
+                    if price:
+                        raw.consumer_price = price
+                        raw.consumer_price_text = text
+                        dom_evidence["consumer_selector"] = label
+                        dom_evidence["consumer_price_text"] = text
+                        break
+            except Exception:
+                continue
+
+        if raw.sales_price or raw.consumer_price:
+            raw.raw_evidence["price_dom"] = dom_evidence
+            _validate_and_fix_prices(raw)
+
+        if not raw.sales_price:
+            await self._text_price_fallback(raw, page)
+
+    async def _text_price_fallback(self, raw: RawProduct, page: Page) -> None:
+        """페이지 본문에서 'N원' 패턴 가격 후보를 수집하는 최후 fallback.
+
+        가격 전후 context에서 배송비/쿠폰/포인트 키워드가 발견되면 제외한다.
+        """
+        try:
+            body_text: str = await page.evaluate("() => document.body.innerText")
+        except Exception:
+            if not raw.sales_price:
+                raw.field_errors["sales_price"] = "본문 텍스트 가격 추출 실패"
+            return
+
+        valid: list[dict[str, Any]] = []
+        excluded: list[dict[str, Any]] = []
+
+        for m in _PRICE_TEXT_RE.finditer(body_text):
+            raw_val = m.group(1).replace(",", "")
+            amount = int(raw_val)
+            if not (_PRICE_RANGE[0] <= amount <= _PRICE_RANGE[1]):
+                continue
+
+            ctx_start = max(0, m.start() - 30)
+            ctx_end = min(len(body_text), m.end() + 30)
+            full_ctx = body_text[ctx_start:ctx_end].strip()
+
+            excluded_by = next((kw for kw in _EXCLUDE_KW if kw in full_ctx), None)
+
+            entry: dict[str, Any] = {
+                "price_text": m.group(0).strip(),
+                "value": amount,
+                "context": full_ctx,
+                "role_hint": None,
+            }
+
+            if excluded_by:
+                entry["excluded_reason"] = excluded_by
+                excluded.append(entry)
+                continue
+
+            if any(kw in full_ctx for kw in _CONSUMER_KW):
+                entry["role_hint"] = "consumer_price"
+            elif any(kw in full_ctx for kw in _SALES_KW):
+                entry["role_hint"] = "sales_price"
+
+            valid.append(entry)
+
+        # 동일 금액 중복 제거 — 역할 힌트 있는 항목 우선
+        seen: dict[int, dict[str, Any]] = {}
+        for c in valid:
+            amt = c["value"]
+            if amt not in seen or (c["role_hint"] and not seen[amt]["role_hint"]):
+                seen[amt] = c
+        deduped = list(seen.values())
+
+        consumer_price: int | None = None
+        sales_price: int | None = None
+
+        if deduped:
+            consumer_hints = [c["value"] for c in deduped if c["role_hint"] == "consumer_price"]
+            sales_hints = [c["value"] for c in deduped if c["role_hint"] == "sales_price"]
+            unclassified = [c["value"] for c in deduped if not c["role_hint"]]
+
+            if consumer_hints:
+                consumer_price = max(consumer_hints)
+            if sales_hints:
+                sales_price = min(sales_hints)
+
+            if not consumer_price and not sales_price:
+                amounts = sorted(unclassified)
+                if len(amounts) >= 2:
+                    consumer_price = amounts[-1]
+                    sales_price = amounts[0]
+                elif amounts:
+                    # 단일 가격 → sales_price로 처리
+                    sales_price = amounts[0]
+            elif sales_price and not consumer_price and unclassified:
+                bigger = [v for v in unclassified if v > sales_price]
+                if bigger:
+                    consumer_price = max(bigger)
+            # consumer_only 케이스: 억지 변환하지 않고 실패 사유를 남긴다
+
+        # 정합성 보정
+        if consumer_price and sales_price:
+            if consumer_price == sales_price:
+                consumer_price = None
+            elif sales_price > consumer_price:
+                raw.field_errors["price_consistency"] = (
+                    f"fallback sales({sales_price}) > consumer({consumer_price}) "
+                    "— consumer_price null 처리"
+                )
+                consumer_price = None
+
+        raw.raw_evidence["price_fallback"] = {
+            "method": "DOM text price fallback",
+            "candidates": deduped,
+            "excluded_candidates": excluded,
+            "selected_consumer_price": consumer_price,
+            "selected_sales_price": sales_price,
+            "note": "본문 가격 후보 중 배송비/쿠폰/포인트 context 제외 후 추정",
+        }
+
+        # 기존에 추출된 값이 있는 경우 덮어쓰지 않는다
+        if sales_price and not raw.sales_price:
+            raw.sales_price = sales_price
+            raw.sales_price_text = f"{sales_price:,}원"
+        elif not sales_price and not raw.sales_price:
+            raw.field_errors["sales_price"] = "DOM selector 및 본문 fallback 모두 실패"
+
+        if consumer_price and not raw.consumer_price:
+            raw.consumer_price = consumer_price
+            raw.consumer_price_text = f"{consumer_price:,}원"
+        elif not consumer_price and not raw.consumer_price:
+            raw.field_errors["consumer_price"] = "정가/소비자가 영역을 찾지 못해 null 처리"
+
+    async def _dom_image(self, page: Page) -> str | None:
+        selectors = [
+            "[class*='productImageArea'] img",
+            "[class*='_2M87qN3cLO'] img",
+            ".product_img img",
+            ".img_photo",
+        ]
+        for sel in selectors:
+            try:
+                el = await page.query_selector(sel)
+                if el:
+                    src = await el.get_attribute("src")
+                    if src and src.startswith("http"):
+                        return src
+            except Exception:
+                continue
+        return None
+
+    async def _dom_options(self, page: Page) -> list[str]:
+        try:
+            opts: list[str] = await page.evaluate("""
+                () => {
+                    const texts = [];
+                    document.querySelectorAll('select option').forEach(o => {
+                        const t = o.textContent.trim();
+                        if (t && !t.includes('선택') && !t.startsWith('-')) texts.push(t);
+                    });
+                    return texts;
+                }
+            """)
+            if opts:
+                return opts[:20]
+        except Exception:
+            pass
+        try:
+            btns: list[str] = await page.evaluate("""
+                () => Array.from(document.querySelectorAll('[class*="option"] button'))
+                          .map(b => b.textContent.trim())
+                          .filter(t => t.length > 0)
+            """)
+            return btns[:20]
+        except Exception:
+            return []
+
+    async def _dom_detail_text(self, page: Page) -> str | None:
+        selectors = [
+            "[class*='detailContents']",
+            "#product-detail",
+            ".product_detail",
+            "[class*='detail_area']",
+        ]
+        for sel in selectors:
+            try:
+                el = await page.query_selector(sel)
+                if el:
+                    text = (await el.inner_text()).strip()
+                    if len(text) > 10:
+                        return text
+            except Exception:
+                continue
+        return None
+
+    async def _dom_category_path(self, page: Page) -> str | None:
+        try:
+            path: str = await page.evaluate("""
+                () => Array.from(
+                    document.querySelectorAll('[class*="breadcrumb"] a, nav[aria-label] a')
+                ).map(a => a.textContent.trim()).filter(t => t.length > 0).join(' > ')
+            """)
+            return path or None
+        except Exception:
+            return None
+
+    async def _dom_soldout(self, page: Page) -> bool:
+        try:
+            result: bool = await page.evaluate("""
+                () => !!document.querySelector(
+                    '[class*="soldOut"], [class*="sold-out"], .sold_out, [class*="SoldOut"]'
+                )
+            """)
+            return bool(result)
+        except Exception:
+            return False
+
+
+def _validate_and_fix_prices(raw: RawProduct) -> None:
+    """DOM selector로 추출한 가격의 정합성을 검사한다."""
+    cp = raw.consumer_price
+    sp = raw.sales_price
+
+    if cp is not None and sp is not None:
+        if cp == sp:
+            raw.consumer_price = None
+            raw.consumer_price_text = None
+            raw.field_errors["consumer_price"] = "정가/소비자가 영역을 찾지 못해 null 처리"
+        elif sp > cp:
+            raw.field_errors["price_consistency"] = (
+                f"DOM selector sales({sp}) > consumer({cp}) "
+                "— consumer_price 신뢰도 낮아 null 처리"
+            )
+            raw.consumer_price = None
+            raw.consumer_price_text = None
