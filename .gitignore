@@ -40,3 +40,11 @@ Thumbs.db
 outputs/*.json
 !outputs/.gitkeep
 !outputs/sample_*.json
+
+# Claude Code local settings
+.claude/
+CLAUDE_SETTINGS_GUIDE.md
+AGENTS.md
+docs/PRICE_RULES.md
+docs/SUBMISSION_GUIDE.md
+docs/COMMIT_AND_SECURITY_RULES.md
