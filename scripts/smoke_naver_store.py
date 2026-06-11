@@ -46,17 +46,22 @@ def _serialize(obj):
 def _print_product(i: int, raw) -> None:
     price_evidence = {
         k: raw.raw_evidence.get(k)
-        for k in ("price_json", "price_dom", "price_fallback")
+        for k in ("price_api", "price_dom", "price_fallback")
         if k in raw.raw_evidence
     }
+    detail_len = len(raw.detail_text) if raw.detail_text else 0
+
     print(f"\n── 상품 {i} {'─' * 40}")
+    print(f"  source_url:      {raw.source_url}")
     print(f"  name:            {raw.name}")
+    print(f"  crawl_error:     {raw.crawl_error}")
     print(f"  sales_price:     {raw.sales_price}")
     print(f"  consumer_price:  {raw.consumer_price}")
     print(f"  primary_image:   {raw.primary_image_url}")
     print(f"  options[:3]:     {raw.option_texts[:3]}")
     print(f"  is_soldout:      {raw.is_soldout}")
     print(f"  category_path:   {raw.category_path}")
+    print(f"  detail_text:     {'있음 (len=' + str(detail_len) + ')' if raw.detail_text else '없음'}")
     print(f"  evidence keys:   {list(raw.raw_evidence.keys())}")
     if price_evidence:
         print(f"  price evidence:")
@@ -68,6 +73,7 @@ def _print_product(i: int, raw) -> None:
 
 async def run(url: str, max_products: int) -> None:
     slug = _store_slug(url)
+    started_at = datetime.now()
     print(f"\n[smoke] URL:          {url}")
     print(f"[smoke] max_products: {max_products}")
     print(f"[smoke] headless:     {settings.playwright_headless}")
@@ -75,7 +81,9 @@ async def run(url: str, max_products: int) -> None:
     async with NaverStoreCrawler() as crawler:
         result = await crawler.crawl(url, max_products=max_products)
 
-    print(f"\n[OK]  수집 성공: {result.success_count}개")
+    print(f"\n[smoke] 발견 URL:     {result.discovered_count}개")
+    print(f"[smoke] 처리 대상:    {min(result.discovered_count, max_products)}개")
+    print(f"[OK]  수집 성공: {result.success_count}개")
     print(f"[ERR] 실패:      {result.failed_count}개")
 
     for i, raw in enumerate(result.products, 1):
@@ -88,18 +96,21 @@ async def run(url: str, max_products: int) -> None:
             print(f"    → {e.get('reason', '')}")
 
     # JSON 저장
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    finished_at = datetime.now()
+    timestamp = started_at.strftime("%Y%m%d_%H%M%S")
     out_path = Path("outputs") / f"smoke_{slug}_{timestamp}.json"
     out_path.parent.mkdir(exist_ok=True)
 
     payload = {
         "store_url": result.store_url,
         "crawler_type": "naver_store",
-        "generated_at": datetime.now().isoformat(),
+        "started_at": started_at.isoformat(),
+        "finished_at": finished_at.isoformat(),
         "summary": {
+            "total_discovered": result.discovered_count,
+            "total_crawled": len(result.products) + len(result.errors),
             "success_count": result.success_count,
             "failed_count": result.failed_count,
-            "returned_count": len(result.products),
         },
         "products": [asdict(p) for p in result.products],
         "errors": result.errors,
