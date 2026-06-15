@@ -45,7 +45,39 @@ REQUEST_DELAY_MAX=1.5
 
 `.env`는 `.gitignore`에 포함되어 있으며 절대 커밋하지 않는다.
 
-### 실행 명령어
+### 환경 변수 전체 목록
+
+```env
+# AI 정규화 (필수 — 없으면 partial 상태로 출력)
+ANTHROPIC_API_KEY=
+
+# Supabase (선택 — 설정 시 크롤링 결과를 DB에 자동 저장)
+SUPABASE_URL=https://xxxx.supabase.co
+SUPABASE_KEY=eyJhbGci...
+
+# 크롤링 동작
+PLAYWRIGHT_HEADLESS=true
+MAX_PRODUCTS=100
+REQUEST_DELAY_MIN=0.5
+REQUEST_DELAY_MAX=1.5
+```
+
+### Supabase 테이블 초기화
+
+Supabase 대시보드 → SQL Editor에서 아래 파일을 실행한다.
+
+```bash
+# 또는 supabase CLI 사용 시
+supabase db push
+```
+
+마이그레이션 파일: `supabase/migrations/001_init.sql`
+
+생성 테이블:
+- `crawl_runs` — 실행 이력 (스토어별 수집 요약)
+- `partner_products` — 정규화된 상품 (`source_url` 기준 upsert)
+
+### 실행 방법 A — CLI
 
 ```bash
 # 네이버 브랜드스토어
@@ -61,7 +93,25 @@ python main.py --url https://m.happylandmall.com/ --max-products 5
 python main.py --url https://brand.naver.com/kefii --max-products 3 --output outputs/kefii.json
 ```
 
-결과는 `outputs/result_{slug}_{timestamp}.json`에 저장된다.
+결과는 `outputs/result_{slug}_{timestamp}.json`에 저장된다. `SUPABASE_URL`이 설정되어 있으면 동시에 DB에도 upsert된다.
+
+### 실행 방법 B — FastAPI 서버
+
+```bash
+uvicorn api:app --reload --port 8000
+```
+
+```
+POST http://localhost:8000/crawl
+Content-Type: application/json
+
+{
+  "url": "https://brand.naver.com/kefii",
+  "max_products": 5
+}
+```
+
+Swagger UI: `http://localhost:8000/docs`
 
 ---
 
@@ -113,6 +163,12 @@ AI(`claude-sonnet-4-6`)는 아래 6개 필드에만 사용한다. 가격·상품
 
 **API 인터셉트 우선 전략**  
 네이버 스토어 상품 상세 페이지를 로드하면 `/n/v2/channels/{id}/products/{pid}` API가 자동 발화한다. Playwright response 핸들러로 이 응답을 가로채 정가(`salePrice`)·할인가(`discountedSalePrice`)·옵션·카테고리를 직접 파싱한다. DOM selector보다 구조가 안정적이고 재시도가 필요 없다.
+
+**Supabase (Postgres)**  
+`SUPABASE_URL`이 설정되면 크롤링 완료 후 결과를 `partner_products` 테이블에 upsert한다. `source_url`을 PK로 사용해 재크롤 시 덮어쓰기(증분 업데이트)가 자연스럽게 된다. `crawl_runs` 테이블로 실행 이력도 관리한다.
+
+**FastAPI**  
+`api.py`에 `POST /crawl` 엔드포인트를 제공한다. CLI(`main.py`)와 동일한 `run_crawl()` 서비스를 공유하며, 큐닷 기존 Next.js + FastAPI 스택에 바로 병합 가능하다.
 
 ---
 

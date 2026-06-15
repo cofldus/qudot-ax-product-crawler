@@ -31,6 +31,10 @@ class Settings(BaseSettings):
     playwright_headless: bool = True
     playwright_timeout: int = 30_000
 
+    # Supabase (선택 — 설정 시 크롤링 결과를 DB에 저장)
+    supabase_url: str = ""
+    supabase_key: str = ""
+
     # 출력
     output_dir: str = "outputs"
 

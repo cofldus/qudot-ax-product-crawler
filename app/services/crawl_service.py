@@ -66,7 +66,7 @@ async def run_crawl(
     total_attempted = len(result.products) + len(product_errors)
     total_crawled = len(result.products)
 
-    return {
+    payload = {
         "store_url": result.store_url,
         "crawler_type": crawler_type,
         "started_at": started_at.isoformat(),
@@ -82,3 +82,9 @@ async def run_crawl(
         "products": product_entries,
         "errors": result.errors,
     }
+
+    # Supabase 설정이 있으면 결과를 DB에 저장 (설정 없으면 건너뜀)
+    from app.db.repository import save_crawl_result
+    await save_crawl_result(payload, cfg)
+
+    return payload

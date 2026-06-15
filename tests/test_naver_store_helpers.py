@@ -220,6 +220,15 @@ class TestAnalyzePriceCandidates:
 
 # ── _text_price_fallback 통합 ─────────────────────────────────────────
 
+def _run_async(coro):
+    """Windows ProactorEventLoop 재사용 충돌을 피하기 위해 매번 새 루프를 생성한다."""
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
+
+
 class TestTextPriceFallbackEvidence:
     def test_candidates_in_raw_evidence(self):
         """price_fallback raw_evidence에 candidates·excluded_candidates 배열이 존재한다."""
@@ -230,7 +239,7 @@ class TestTextPriceFallbackEvidence:
             await NaverStoreCrawler._text_price_fallback(None, raw, page)  # type: ignore[arg-type]
             return raw
 
-        raw = asyncio.run(_inner())
+        raw = _run_async(_inner())
         pf = raw.raw_evidence.get("price_fallback", {})
         assert "candidates" in pf
         assert isinstance(pf["candidates"], list)
@@ -249,5 +258,5 @@ class TestTextPriceFallbackEvidence:
             await NaverStoreCrawler._text_price_fallback(None, raw, page)  # type: ignore[arg-type]
             return raw
 
-        raw = asyncio.run(_inner())
+        raw = _run_async(_inner())
         assert "sales_price" in raw.field_errors
