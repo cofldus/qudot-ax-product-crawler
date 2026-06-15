@@ -187,9 +187,11 @@ class TestAnalyzePriceCandidates:
         assert any("적립" in e["excluded_reason"] for e in excluded)
 
     def test_포인트_context_excluded(self):
+        # "포인트"와 "적립" 두 키워드가 모두 있을 때 1,000원이 제외되는지 검증
+        # excluded_reason은 먼저 매칭된 키워드로 설정되므로 특정 키워드 대신 value로 검증한다
         text = "포인트 1,000원 적립  판매가 20,000원"
         _, excluded, _, _, _ = _analyze_price_candidates(text)
-        assert any("포인트" in e["excluded_reason"] for e in excluded)
+        assert any(e["value"] == 1000 for e in excluded)
 
     def test_single_price_to_sales_only(self):
         text = "이 상품의 가격은 5,000원 입니다"

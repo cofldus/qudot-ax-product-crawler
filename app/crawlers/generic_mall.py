@@ -101,10 +101,14 @@ class GenericMallCrawler(BaseCrawler):
 
     async def _extract_name(self, page: Page) -> str | None:
         selectors = [
+            # Godomall(NHN Commerce) 모바일
+            "#prd_name", ".prd_name", "#goods_prd_name",
+            ".item_detail_tit", ".prd_detail .prd_name",
+            # 공통 커머스 패턴
             "h1.goods_name", "h1.product_name", ".goods_name h1",
             "h2.product_name", ".product_title h1", ".product_title h2",
             "#goods_name", "#product_name", ".item_name",
-            "h1", "h2",
+            ".goods_name", ".product_name",
         ]
         for sel in selectors:
             try:

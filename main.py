@@ -30,6 +30,7 @@ def _print_summary(payload: dict) -> None:
     s = payload["summary"]
     print(f"\n[완료] {payload['store_url']} ({payload['crawler_type']})")
     print(f"  발견:    {s['total_discovered']}개")
+    print(f"  시도:    {s['total_attempted']}개")
     print(f"  크롤링:  {s['total_crawled']}개")
     print(f"  정규화:  {s['total_normalized']}개")
     print(f"  실패:    {s['failed_count']}개")

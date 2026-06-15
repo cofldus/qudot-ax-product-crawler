@@ -59,6 +59,13 @@ async def run_crawl(
             "raw_evidence": raw.raw_evidence,
         })
 
+    # DISCOVERY_FAILED는 상품 단위 시도가 없으므로 total_attempted 에서 제외
+    product_errors = [
+        e for e in result.errors if e.get("error_type") != "DISCOVERY_FAILED"
+    ]
+    total_attempted = len(result.products) + len(product_errors)
+    total_crawled = len(result.products)
+
     return {
         "store_url": result.store_url,
         "crawler_type": crawler_type,
@@ -66,7 +73,8 @@ async def run_crawl(
         "finished_at": finished_at.isoformat(),
         "summary": {
             "total_discovered": result.discovered_count,
-            "total_crawled": len(result.products) + len(result.errors),
+            "total_attempted": total_attempted,
+            "total_crawled": total_crawled,
             "total_normalized": total_normalized,
             "failed_count": result.failed_count,
             "partial_count": partial_count,

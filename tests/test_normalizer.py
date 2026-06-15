@@ -101,8 +101,8 @@ class TestBuildPartnerProduct:
 
 
 class TestNormalize:
-    def test_no_api_key_returns_raw_only(self):
-        """API 키 없으면 raw_only 반환, 결정적 필드는 유지된다."""
+    def test_no_api_key_returns_partial(self):
+        """API 키 없으면 partial 반환, 결정적 필드는 유지된다."""
         raw = _raw()
 
         class _FakeCfg:
@@ -112,7 +112,7 @@ class TestNormalize:
             detail_text_limit = 2000
 
         pp, status = asyncio.run(normalize(raw, _FakeCfg()))
-        assert status == "raw_only"
+        assert status == "partial"
         assert pp.name == "테스트 상품"
         assert pp.sales_price == 15000
         assert pp.consumer_price == 20000
@@ -137,7 +137,7 @@ class TestNormalize:
         with mock.patch.dict("sys.modules", {"anthropic": mock_anthropic}):
             pp, status = asyncio.run(normalize(raw, _FakeCfg()))
 
-        assert status == "raw_only"
+        assert status == "partial"
         assert pp.name == "테스트 상품"
         assert pp.sales_price == 15000
         assert pp.consumer_price == 20000

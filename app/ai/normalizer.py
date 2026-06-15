@@ -103,7 +103,7 @@ async def normalize(
         missing_reasons.setdefault("hashtags", "ANTHROPIC_API_KEY 미설정")
         missing_reasons.setdefault("usp", "ANTHROPIC_API_KEY 미설정")
         pp = _build_partner_product(raw, None, [], missing_reasons)
-        return pp, "raw_only"
+        return pp, "partial"
 
     user_prompt = build_user_prompt(
         name=raw.name,
@@ -151,4 +151,4 @@ async def normalize(
         missing_reasons.setdefault("hashtags", f"AI 호출 실패: {type(exc).__name__}")
         missing_reasons.setdefault("usp", f"AI 호출 실패: {type(exc).__name__}")
         pp = _build_partner_product(raw, None, [], missing_reasons)
-        return pp, "raw_only"
+        return pp, "partial"
