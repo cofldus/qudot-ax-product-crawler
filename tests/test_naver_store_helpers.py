@@ -1,12 +1,18 @@
 """app/crawlers/naver_store.py 헬퍼 함수 단위 테스트."""
 from __future__ import annotations
 
+import asyncio
+import unittest.mock as mock
+
 import pytest
 
 from app.crawlers.naver_store import (
+    NaverStoreCrawler,
+    _analyze_price_candidates,
     _extract_product_id,
     _is_invalid_product_name,
     _parse_price,
+    _response_matches_product_id,
     _validate_and_fix_prices,
 )
 from app.schemas.raw_product import RawProduct
@@ -137,3 +143,109 @@ class TestValidateAndFixPrices:
         _validate_and_fix_prices(raw)
         assert raw.sales_price == 10000
         assert raw.consumer_price is None
+
+
+# ── _response_matches_product_id ─────────────────────────────────────
+
+class TestResponseMatchesProductId:
+    def test_productNo_matches(self):
+        assert _response_matches_product_id({"productNo": 12345}, "12345") is True
+
+    def test_channelProductNo_matches(self):
+        assert _response_matches_product_id({"channelProductNo": "9999"}, "9999") is True
+
+    def test_id_matches(self):
+        assert _response_matches_product_id({"id": 777}, "777") is True
+
+    def test_no_matching_key(self):
+        assert _response_matches_product_id({"name": "테스트"}, "12345") is False
+
+    def test_wrong_value(self):
+        assert _response_matches_product_id({"productNo": 99999}, "12345") is False
+
+    def test_non_dict_returns_false(self):
+        assert _response_matches_product_id([], "12345") is False  # type: ignore[arg-type]
+
+
+# ── _analyze_price_candidates ─────────────────────────────────────────
+
+class TestAnalyzePriceCandidates:
+    def test_배송비_context_excluded(self):
+        text = "판매가 15,000원\n배송비 3,000원"
+        candidates, excluded, _, _, _ = _analyze_price_candidates(text)
+        assert any(e["value"] == 3000 and "배송비" in e["excluded_reason"] for e in excluded)
+        assert not any(c["value"] == 3000 for c in candidates)
+
+    def test_쿠폰_context_excluded(self):
+        text = "쿠폰 2,000원 할인 가능  판매가 12,000원"
+        _, excluded, _, _, _ = _analyze_price_candidates(text)
+        assert any("쿠폰" in e["excluded_reason"] for e in excluded)
+
+    def test_적립_context_excluded(self):
+        text = "적립 500원  판매가 8,000원"
+        _, excluded, _, _, _ = _analyze_price_candidates(text)
+        assert any("적립" in e["excluded_reason"] for e in excluded)
+
+    def test_포인트_context_excluded(self):
+        text = "포인트 1,000원 적립  판매가 20,000원"
+        _, excluded, _, _, _ = _analyze_price_candidates(text)
+        assert any("포인트" in e["excluded_reason"] for e in excluded)
+
+    def test_single_price_to_sales_only(self):
+        text = "이 상품의 가격은 5,000원 입니다"
+        candidates, _, consumer, sales, _ = _analyze_price_candidates(text)
+        assert sales == 5000
+        assert consumer is None
+
+    def test_candidates_structure_fields(self):
+        text = "정가 20,000원  판매가 15,000원"
+        candidates, excluded, _, _, _ = _analyze_price_candidates(text)
+        assert isinstance(candidates, list)
+        assert isinstance(excluded, list)
+        for c in candidates:
+            assert "price_text" in c
+            assert "value" in c
+            assert "context" in c
+            assert "role_hint" in c
+
+    def test_no_prices_returns_empty(self):
+        text = "아무 가격 정보가 없는 텍스트"
+        candidates, excluded, consumer, sales, _ = _analyze_price_candidates(text)
+        assert candidates == []
+        assert sales is None
+        assert consumer is None
+
+
+# ── _text_price_fallback 통합 ─────────────────────────────────────────
+
+class TestTextPriceFallbackEvidence:
+    def test_candidates_in_raw_evidence(self):
+        """price_fallback raw_evidence에 candidates·excluded_candidates 배열이 존재한다."""
+        async def _inner():
+            raw = RawProduct(source_url="https://example.com")
+            page = mock.MagicMock()
+            page.evaluate = mock.AsyncMock(return_value="판매가 15,000원  배송비 3,000원")
+            await NaverStoreCrawler._text_price_fallback(None, raw, page)  # type: ignore[arg-type]
+            return raw
+
+        raw = asyncio.run(_inner())
+        pf = raw.raw_evidence.get("price_fallback", {})
+        assert "candidates" in pf
+        assert isinstance(pf["candidates"], list)
+        assert "excluded_candidates" in pf
+        assert isinstance(pf["excluded_candidates"], list)
+
+    def test_no_valid_price_sets_sales_field_error(self):
+        """유효 가격이 없으면 field_errors['sales_price']가 설정된다."""
+        async def _inner():
+            raw = RawProduct(source_url="https://example.com")
+            page = mock.MagicMock()
+            # 모두 제외 키워드 context 내 가격
+            page.evaluate = mock.AsyncMock(
+                return_value="배송비 3,000원  쿠폰 2,000원  포인트 500원"
+            )
+            await NaverStoreCrawler._text_price_fallback(None, raw, page)  # type: ignore[arg-type]
+            return raw
+
+        raw = asyncio.run(_inner())
+        assert "sales_price" in raw.field_errors

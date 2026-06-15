@@ -8,6 +8,7 @@ from urllib.parse import urlparse
 
 from playwright.async_api import Page
 
+from app.config import Settings
 from app.crawlers.base import BaseCrawler
 from app.schemas.raw_product import RawProduct
 
@@ -51,8 +52,16 @@ _NAME_KEYS = frozenset({"name", "productName", "channelProductName"})
 _IMAGE_KEYS = frozenset({"representativeImage", "mainImage", "imageUrl"})
 _PRODUCT_ID_KEYS = frozenset({"productNo", "channelProductNo"})
 
+# 상품 목록 API 탐지 — discover 단계에서 사용
 _API_URL_PATTERN = re.compile(
     r"products?|channel-products?|category|search", re.IGNORECASE
+)
+
+# 상품 상세 API 탐지 — extract 단계에서 사용
+# /n/v2/channels/ = 브랜드스토어, /i/v2/channels/ = 스마트스토어
+_NAVER_DETAIL_API_RE = re.compile(
+    r"/n/v2/channels/|/i/v2/channels/|channel-products?",
+    re.IGNORECASE,
 )
 
 
@@ -100,6 +109,20 @@ def _store_base_url(store_url: str) -> str:
     first_segment = parsed.path.strip("/").split("/")[0]
     base = f"{parsed.scheme}://{parsed.netloc}"
     return f"{base}/{first_segment}" if first_segment else base
+
+
+def _response_matches_product_id(data: dict[str, Any], product_id: str) -> bool:
+    """API 응답 최상위에 product_id와 일치하는 식별 필드가 있는지 확인한다.
+
+    URL 경로로 상품을 특정할 수 없는 API에서 body 기반 2차 검증에 사용한다.
+    """
+    if not isinstance(data, dict):
+        return False
+    for key in ("productNo", "channelProductNo", "id"):
+        val = data.get(key)
+        if val is not None and str(val) == product_id:
+            return True
+    return False
 
 
 # ── __NEXT_DATA__ / API 응답 JSON 탐색 헬퍼 ──────────────────────────
@@ -169,6 +192,99 @@ def _extract_fields_from_json(data: Any) -> dict[str, Any]:
     return result
 
 
+def _analyze_price_candidates(
+    body_text: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int | None, int | None, str | None]:
+    """본문 텍스트에서 'N원' 가격 후보를 분석한다.
+
+    Returns:
+        (candidates, excluded_candidates, consumer_price, sales_price, consistency_error)
+        candidates: 유효 후보 (price_text, value, context, role_hint)
+        excluded_candidates: 제외된 후보 (+ excluded_reason)
+        consumer_price: 선택된 정가 (없으면 None)
+        sales_price: 선택된 판매가 (없으면 None)
+        consistency_error: sales > consumer 발생 시 오류 메시지
+    """
+    valid: list[dict[str, Any]] = []
+    excluded: list[dict[str, Any]] = []
+
+    for m in _PRICE_TEXT_RE.finditer(body_text):
+        amount = int(m.group(1).replace(",", ""))
+        if not (_PRICE_RANGE[0] <= amount <= _PRICE_RANGE[1]):
+            continue
+
+        ctx_start = max(0, m.start() - 30)
+        ctx_end = min(len(body_text), m.end() + 30)
+        full_ctx = body_text[ctx_start:ctx_end].strip()
+
+        excluded_by = next((kw for kw in _EXCLUDE_KW if kw in full_ctx), None)
+
+        entry: dict[str, Any] = {
+            "price_text": m.group(0).strip(),
+            "value": amount,
+            "context": full_ctx,
+            "role_hint": None,
+        }
+
+        if excluded_by:
+            entry["excluded_reason"] = excluded_by
+            excluded.append(entry)
+            continue
+
+        if any(kw in full_ctx for kw in _CONSUMER_KW):
+            entry["role_hint"] = "consumer_price"
+        elif any(kw in full_ctx for kw in _SALES_KW):
+            entry["role_hint"] = "sales_price"
+
+        valid.append(entry)
+
+    # 동일 금액 중복 제거 — 역할 힌트 있는 항목 우선
+    seen_val: dict[int, dict[str, Any]] = {}
+    for c in valid:
+        amt = c["value"]
+        if amt not in seen_val or (c["role_hint"] and not seen_val[amt]["role_hint"]):
+            seen_val[amt] = c
+    candidates = list(seen_val.values())
+
+    consumer_price: int | None = None
+    sales_price: int | None = None
+
+    if candidates:
+        consumer_hints = [c["value"] for c in candidates if c["role_hint"] == "consumer_price"]
+        sales_hints = [c["value"] for c in candidates if c["role_hint"] == "sales_price"]
+        unclassified = [c["value"] for c in candidates if not c["role_hint"]]
+
+        if consumer_hints:
+            consumer_price = max(consumer_hints)
+        if sales_hints:
+            sales_price = min(sales_hints)
+
+        if not consumer_price and not sales_price:
+            amounts = sorted(unclassified)
+            if len(amounts) >= 2:
+                consumer_price = amounts[-1]
+                sales_price = amounts[0]
+            elif amounts:
+                sales_price = amounts[0]
+        elif sales_price and not consumer_price and unclassified:
+            bigger = [v for v in unclassified if v > sales_price]
+            if bigger:
+                consumer_price = max(bigger)
+
+    consistency_error: str | None = None
+    if consumer_price and sales_price:
+        if consumer_price == sales_price:
+            consumer_price = None
+        elif sales_price > consumer_price:
+            consistency_error = (
+                f"fallback sales({sales_price}) > consumer({consumer_price}) "
+                "— consumer_price null 처리"
+            )
+            consumer_price = None
+
+    return candidates, excluded, consumer_price, sales_price, consistency_error
+
+
 # ── 크롤러 ──────────────────────────────────────────────────────────
 
 class NaverStoreCrawler(BaseCrawler):
@@ -180,12 +296,17 @@ class NaverStoreCrawler(BaseCrawler):
       3. API 응답 인터셉트 (보조 — 추천/번들 상품 ID 오탐 가능성 있음)
 
     상세 추출 우선순위:
-      1. /n/v2/channels/*/products/<product_id> product detail API
+      1. /n/v2/ 또는 /i/v2/ channels 상품 detail API (브랜드스토어·스마트스토어 공통)
       2. /products/<product_id>/contents/<content_id>/ contents API
       3. __NEXT_DATA__ JSON fallback
       4. DOM selector fallback
       5. 페이지 본문 텍스트 가격 fallback (가격 전용)
     """
+
+    def __init__(self, cfg: Settings | None = None) -> None:
+        super().__init__(cfg)
+        # _discover 완료 후 URL 소스별 카운트를 보존 (smoke 출력용)
+        self._last_source_counts: dict[str, int] = {}
 
     async def discover_product_urls(self, store_url: str) -> list[str]:
         assert self._context is not None
@@ -229,14 +350,33 @@ class NaverStoreCrawler(BaseCrawler):
             await asyncio.gather(*_pending_tasks, return_exceptions=True)
 
         if not ok:
+            self._last_source_counts = {}
             return []
 
         api_urls = list(dict.fromkeys(intercepted_urls))
 
         # DOM 노출 URL 우선 — API 인터셉트는 추천/번들 상품 보완용
+        # 소스별로 추적해 smoke 출력에서 신뢰도를 구분한다
         merged: dict[str, None] = {}
-        for u in dom_urls + next_data_urls + api_urls:
-            merged[u] = None
+        source_map: dict[str, str] = {}
+
+        for u in dom_urls:
+            if u not in merged:
+                merged[u] = None
+                source_map[u] = "DOM"
+        for u in next_data_urls:
+            if u not in merged:
+                merged[u] = None
+                source_map[u] = "__NEXT_DATA__"
+        for u in api_urls:
+            if u not in merged:
+                merged[u] = None
+                source_map[u] = "API"
+
+        counts: dict[str, int] = {}
+        for src in source_map.values():
+            counts[src] = counts.get(src, 0) + 1
+        self._last_source_counts = counts
 
         return list(merged)
 
@@ -287,23 +427,39 @@ class NaverStoreCrawler(BaseCrawler):
 
         product_api_data: dict[str, Any] = {}
         contents_api_data: dict[str, Any] = {}
+        matched_api_urls: list[str] = []
+        unmatched_count: list[int] = [0]
         _pending_tasks: list[asyncio.Task] = []
 
         async def _handle_apis(response) -> None:
-            if "/n/v2/channels/" not in response.url:
+            url = response.url
+            resp_url = url.split("?")[0]
+            # 채널 API이거나 URL 경로에 product_id가 포함된 경우만 처리
+            is_channel_api = bool(_NAVER_DETAIL_API_RE.search(url))
+            has_product_in_path = f"/products/{product_id}" in resp_url
+            if not is_channel_api and not has_product_in_path:
                 return
-            resp_url = response.url.split("?")[0]
+            content_type = response.headers.get("content-type", "")
+            if "json" not in content_type:
+                return
             try:
+                body = await response.json()
+                if not isinstance(body, dict):
+                    return
+                # URL 경로로 상품 확정: /products/{product_id} 끝 세그먼트
                 if resp_url.endswith(f"/products/{product_id}"):
-                    # 메인 상품 detail API
-                    body = await response.json()
-                    if isinstance(body, dict):
-                        product_api_data.update(body)
+                    product_api_data.update(body)
+                    matched_api_urls.append(resp_url)
+                # contents API: /products/{product_id}/contents/...
                 elif f"/products/{product_id}/contents/" in resp_url:
-                    # 상세설명 contents API
-                    body = await response.json()
-                    if isinstance(body, dict):
-                        contents_api_data.update(body)
+                    contents_api_data.update(body)
+                    matched_api_urls.append(resp_url)
+                # body 검증: 상품 ID가 응답 내 식별 필드와 일치하는 경우
+                elif _response_matches_product_id(body, product_id):
+                    product_api_data.update(body)
+                    matched_api_urls.append(resp_url)
+                else:
+                    unmatched_count[0] += 1
             except Exception:
                 pass
 
@@ -317,6 +473,30 @@ class NaverStoreCrawler(BaseCrawler):
 
         if _pending_tasks:
             await asyncio.gather(*_pending_tasks, return_exceptions=True)
+
+        # 접근 결과 기록 — 로그인 리디렉트·접근 차단 감지
+        final_url = page.url
+        try:
+            page_title = await page.title()
+        except Exception:
+            page_title = ""
+
+        login_detected = (
+            "nid.naver.com" in final_url
+            or "login" in final_url.lower()
+        )
+
+        raw.raw_evidence["access"] = {
+            "final_url": final_url,
+            "page_title": page_title,
+            "redirect_or_login_detected": login_detected,
+            "matched_api_urls": matched_api_urls,
+            "unmatched_api_urls_count": unmatched_count[0],
+        }
+
+        if login_detected:
+            raw.crawl_error = "로그인 페이지로 리디렉트됨 — 비인증 접근 차단"
+            return raw
 
         if not ok:
             raw.crawl_error = f"페이지 로딩 실패: {product_url}"
@@ -362,7 +542,7 @@ class NaverStoreCrawler(BaseCrawler):
             img = await self._dom_image(page)
             if img:
                 raw.image_urls = [_normalize_image_url(img)]
-                raw.raw_evidence["image_url"] = f"DOM img fallback"
+                raw.raw_evidence["image_url"] = "DOM img fallback"
             else:
                 raw.field_errors["image_url"] = "DOM에서 대표 이미지를 찾지 못함"
 
@@ -403,7 +583,7 @@ class NaverStoreCrawler(BaseCrawler):
         return raw
 
     def _apply_product_api_fields(self, raw: RawProduct, data: dict[str, Any]) -> None:
-        """product detail API(/n/v2/channels/*/products/<id>) 응답에서 결정적 필드 추출."""
+        """product detail API(/n/v2/ 또는 /i/v2/ channels) 응답에서 결정적 필드 추출."""
         # 상품명
         name = data.get("name") or data.get("channelProductName") or data.get("dispName")
         if name and isinstance(name, str):
@@ -461,7 +641,6 @@ class NaverStoreCrawler(BaseCrawler):
                     if url not in images:
                         images.append(url)
 
-        # DOM img fallback: productImages 키도 시도
         if not images:
             for img in data.get("productImages", []):
                 if isinstance(img, dict):
@@ -607,7 +786,6 @@ class NaverStoreCrawler(BaseCrawler):
             except Exception:
                 continue
 
-        # h3 중 가장 긴 텍스트 (상품명은 대체로 h3에 위치)
         try:
             h3_texts: list[str] = await page.evaluate(
                 "() => Array.from(document.querySelectorAll('h3'))"
@@ -619,7 +797,6 @@ class NaverStoreCrawler(BaseCrawler):
         except Exception:
             pass
 
-        # 페이지 타이틀 fallback — "상품명 : 스토어명" 패턴
         try:
             title = await page.title()
             if " : " in title:
@@ -705,87 +882,17 @@ class NaverStoreCrawler(BaseCrawler):
                 raw.field_errors["sales_price"] = "본문 텍스트 가격 추출 실패"
             return
 
-        valid: list[dict[str, Any]] = []
-        excluded: list[dict[str, Any]] = []
+        candidates, excluded, consumer_price, sales_price, consistency_err = (
+            _analyze_price_candidates(body_text)
+        )
 
-        for m in _PRICE_TEXT_RE.finditer(body_text):
-            raw_val = m.group(1).replace(",", "")
-            amount = int(raw_val)
-            if not (_PRICE_RANGE[0] <= amount <= _PRICE_RANGE[1]):
-                continue
-
-            ctx_start = max(0, m.start() - 30)
-            ctx_end = min(len(body_text), m.end() + 30)
-            full_ctx = body_text[ctx_start:ctx_end].strip()
-
-            excluded_by = next((kw for kw in _EXCLUDE_KW if kw in full_ctx), None)
-
-            entry: dict[str, Any] = {
-                "price_text": m.group(0).strip(),
-                "value": amount,
-                "context": full_ctx,
-                "role_hint": None,
-            }
-
-            if excluded_by:
-                entry["excluded_reason"] = excluded_by
-                excluded.append(entry)
-                continue
-
-            if any(kw in full_ctx for kw in _CONSUMER_KW):
-                entry["role_hint"] = "consumer_price"
-            elif any(kw in full_ctx for kw in _SALES_KW):
-                entry["role_hint"] = "sales_price"
-
-            valid.append(entry)
-
-        # 동일 금액 중복 제거 — 역할 힌트 있는 항목 우선
-        seen_val: dict[int, dict[str, Any]] = {}
-        for c in valid:
-            amt = c["value"]
-            if amt not in seen_val or (c["role_hint"] and not seen_val[amt]["role_hint"]):
-                seen_val[amt] = c
-        deduped = list(seen_val.values())
-
-        consumer_price: int | None = None
-        sales_price: int | None = None
-
-        if deduped:
-            consumer_hints = [c["value"] for c in deduped if c["role_hint"] == "consumer_price"]
-            sales_hints = [c["value"] for c in deduped if c["role_hint"] == "sales_price"]
-            unclassified = [c["value"] for c in deduped if not c["role_hint"]]
-
-            if consumer_hints:
-                consumer_price = max(consumer_hints)
-            if sales_hints:
-                sales_price = min(sales_hints)
-
-            if not consumer_price and not sales_price:
-                amounts = sorted(unclassified)
-                if len(amounts) >= 2:
-                    consumer_price = amounts[-1]
-                    sales_price = amounts[0]
-                elif amounts:
-                    sales_price = amounts[0]
-            elif sales_price and not consumer_price and unclassified:
-                bigger = [v for v in unclassified if v > sales_price]
-                if bigger:
-                    consumer_price = max(bigger)
-
-        if consumer_price and sales_price:
-            if consumer_price == sales_price:
-                consumer_price = None
-            elif sales_price > consumer_price:
-                raw.field_errors["price_consistency"] = (
-                    f"fallback sales({sales_price}) > consumer({consumer_price}) "
-                    "— consumer_price null 처리"
-                )
-                consumer_price = None
+        if consistency_err:
+            raw.field_errors["price_consistency"] = consistency_err
 
         raw.raw_evidence["price_fallback"] = {
             "method": "DOM text price fallback",
-            "candidate_count": len(deduped),
-            "excluded_count": len(excluded),
+            "candidates": candidates,
+            "excluded_candidates": excluded,
             "selected_consumer_price": consumer_price,
             "selected_sales_price": sales_price,
         }

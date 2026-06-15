@@ -34,7 +34,7 @@ playwright install chromium
 `.env` 파일을 프로젝트 루트에 생성한다.
 
 ```env
-ANTHROPIC_API_KEY=sk-ant-...
+ANTHROPIC_API_KEY=
 PLAYWRIGHT_HEADLESS=true
 MAX_PRODUCTS=100
 REQUEST_DELAY_MIN=0.5
@@ -152,7 +152,7 @@ category_group, usp, hashtags, option1/option2, brand_name 5개 필드에만 AI�
   "errors": [
     {
       "url": "https://smartstore.naver.com/phytonutri/products/9623766251",
-      "reason": "Naver 로그인 필요: 스토어가 비인증 접근을 차단함",
+      "reason": "로그인 페이지로 리디렉트됨 — 비인증 접근 차단",
       "error_type": "EXTRACT_FAILED"
     }
   ]

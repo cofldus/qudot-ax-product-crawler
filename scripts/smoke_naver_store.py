@@ -80,8 +80,12 @@ async def run(url: str, max_products: int) -> None:
 
     async with NaverStoreCrawler() as crawler:
         result = await crawler.crawl(url, max_products=max_products)
+        source_counts = crawler._last_source_counts
 
     print(f"\n[smoke] 발견 URL:     {result.discovered_count}개")
+    if source_counts:
+        breakdown = "  ".join(f"{src}={cnt}" for src, cnt in source_counts.items())
+        print(f"[smoke] 소스 분포:    {breakdown}")
     print(f"[smoke] 처리 대상:    {min(result.discovered_count, max_products)}개")
     print(f"[OK]  수집 성공: {result.success_count}개")
     print(f"[ERR] 실패:      {result.failed_count}개")
