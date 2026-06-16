@@ -29,6 +29,7 @@ class RawProduct:
     sales_price_text: str | None = None      # 판매가 원본 텍스트
     consumer_price: int | None = None        # 파싱된 정가 (원)
     sales_price: int | None = None           # 파싱된 판매가 (원)
+    lowest_price: int | None = None          # 네이버 쇼핑 최저가 (--lowest-price 플래그 시 채움)
 
     # 옵션 — 원본 텍스트 목록 (AI가 정규화 예정)
     option_texts: list[str] = field(default_factory=list)

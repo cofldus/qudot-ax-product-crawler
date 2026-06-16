@@ -129,7 +129,27 @@ class BaseCrawler(ABC):
                     })
                     break
 
+                # 증분 재크롤 — 최근 24h 이내 수집한 URL은 건너뜀
+                if self.cfg.incremental and self.cfg.supabase_url:
+                    if await self._is_recently_crawled(url):
+                        continue
+
                 raw = await self._extract_with_retry(page, url)
+
+                # 자가복구 — 결정적 추출 실패 시 LLM으로 재분석
+                if self.cfg.enable_recovery and (
+                    raw.name is None or raw.sales_price is None
+                ):
+                    try:
+                        body_text = await page.evaluate("() => document.body.innerText")
+                        from app.ai.recovery import recover_missing_fields
+                        await recover_missing_fields(raw, body_text, self.cfg)
+                    except Exception:
+                        pass
+
+                # 최저가 실크롤링 (네이버 쇼핑)
+                if self.cfg.enable_lowest_price and not raw.crawl_error and raw.name:
+                    await self._enrich_lowest_price(raw)
 
                 if raw.crawl_error:
                     consecutive_failures += 1
@@ -163,6 +183,55 @@ class BaseCrawler(ABC):
             f"재시도 {self.cfg.crawl_retry_count}회 후 실패: {last_error[:200]}"
         )
         return raw
+
+    async def _enrich_lowest_price(self, raw: RawProduct) -> None:
+        """별도 페이지에서 네이버 쇼핑 최저가를 조회해 raw에 기록한다.
+
+        - 결과가 None이면 (오탐·미검출) lowest_price는 null로 유지하고 사유를 기록한다.
+        - lowest_price가 sales_price보다 비정상적으로 낮으면 (10% 미만) 반영하지 않는다.
+        """
+        shopping_page = await self._context.new_page()
+        try:
+            from app.crawlers.naver_shopping import fetch_lowest_price
+            result = await fetch_lowest_price(raw.name or "", shopping_page)
+            if result:
+                lp = result["price"]
+                # 판매가 대비 비정상적으로 낮은 최저가는 오탐으로 간주
+                if raw.sales_price and lp < raw.sales_price * 0.1:
+                    raw.field_errors["lowest_price"] = (
+                        f"최저가({lp:,}원)가 판매가({raw.sales_price:,}원) 대비 10% 미만 — 오탐 제외"
+                    )
+                    raw.raw_evidence["lowest_price"] = result
+                else:
+                    raw.lowest_price = lp
+                    raw.raw_evidence["lowest_price"] = result
+            else:
+                raw.field_errors["lowest_price"] = (
+                    "네이버 쇼핑 최저가 조회 실패 — 가격 미검출 또는 유사도 미달"
+                )
+        except Exception as exc:
+            raw.field_errors["lowest_price"] = f"최저가 조회 오류: {exc}"
+        finally:
+            await shopping_page.close()
+
+    async def _is_recently_crawled(self, url: str, hours: int = 24) -> bool:
+        """Supabase에서 해당 URL이 최근 hours 시간 이내 수집됐는지 확인한다."""
+        try:
+            from app.db.client import get_client
+            client = await get_client(self.cfg.supabase_url, self.cfg.supabase_key)
+            from datetime import datetime, timedelta, timezone
+            cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+            res = await (
+                client.table("partner_products")
+                .select("source_url, crawled_at")
+                .eq("source_url", url)
+                .gt("crawled_at", cutoff)
+                .limit(1)
+                .execute()
+            )
+            return bool(res.data)
+        except Exception:
+            return False
 
     async def _random_delay(self) -> None:
         delay = random.uniform(self.cfg.request_delay_min, self.cfg.request_delay_max)

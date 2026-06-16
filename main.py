@@ -42,11 +42,14 @@ def _print_summary(payload: dict) -> None:
         status = p.get("status", "")
         sp = pp.get("sales_price")
         cp = pp.get("consumer_price")
+        lp = pp.get("lowest_price")
         print(f"\n  [{i}] [{status}] {name}")
         if sp:
             price_str = f"판매가 {sp:,}원"
             if cp:
                 price_str += f" / 정가 {cp:,}원"
+            if lp:
+                price_str += f" / 최저가 {lp:,}원"
             print(f"       {price_str}")
         errors = p.get("field_errors", {})
         if errors:
@@ -59,8 +62,19 @@ def _print_summary(payload: dict) -> None:
             print(f"      → {e.get('reason', '')}")
 
 
-async def _run(url: str, max_products: int, output: str | None) -> None:
+async def _run(
+    url: str,
+    max_products: int,
+    output: str | None,
+    lowest_price: bool = False,
+    incremental: bool = False,
+) -> None:
+    from app.config import settings
     from app.services.crawl_service import run_crawl
+
+    # 런타임 설정 오버라이드
+    settings.enable_lowest_price = lowest_price
+    settings.incremental = incremental
 
     payload = await run_crawl(url, max_products=max_products)
 
@@ -92,9 +106,23 @@ def main() -> None:
         "--output", default=None,
         help="출력 JSON 경로 (기본: outputs/result_{slug}_{timestamp}.json)",
     )
+    parser.add_argument(
+        "--lowest-price", action="store_true", default=False,
+        help="네이버 쇼핑 최저가 실크롤링 활성화 (속도 느려짐)",
+    )
+    parser.add_argument(
+        "--incremental", action="store_true", default=False,
+        help="증분 재크롤 — 24h 이내 수집한 URL 건너뜀 (Supabase 필요)",
+    )
     args = parser.parse_args()
 
-    asyncio.run(_run(args.url, args.max_products, args.output))
+    asyncio.run(_run(
+        args.url,
+        args.max_products,
+        args.output,
+        args.lowest_price,
+        args.incremental,
+    ))
 
 
 if __name__ == "__main__":

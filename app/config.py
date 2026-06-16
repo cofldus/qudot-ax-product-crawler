@@ -35,6 +35,11 @@ class Settings(BaseSettings):
     supabase_url: str = ""
     supabase_key: str = ""
 
+    # 가산점 기능
+    enable_lowest_price: bool = False   # 네이버 쇼핑 최저가 실크롤링
+    enable_recovery: bool = True        # 결정적 추출 실패 시 LLM 자가복구
+    incremental: bool = False           # 증분 재크롤 (24h 이내 수집분 건너뜀)
+
     # 출력
     output_dir: str = "outputs"
 

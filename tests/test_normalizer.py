@@ -13,6 +13,14 @@ from app.ai.normalizer import _build_partner_product, normalize
 from app.schemas.raw_product import RawProduct
 
 
+def _run_async(coro):
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
+
+
 def _raw(
     *,
     name: str | None = "테스트 상품",
@@ -46,7 +54,8 @@ class TestBuildPartnerProduct:
         pp = _build_partner_product(raw, None, [], {})
         assert pp.discount_rate == 25.0
 
-    def test_lowest_price_always_null_with_missing_reason(self):
+    def test_lowest_price_null_when_not_enriched(self):
+        """raw.lowest_price 미설정 시 pp.lowest_price는 None이고 missing_reasons에 사유가 기록된다."""
         raw = _raw()
         pp = _build_partner_product(raw, None, [], {})
         assert pp.lowest_price is None
@@ -111,7 +120,7 @@ class TestNormalize:
             llm_timeout = 30
             detail_text_limit = 2000
 
-        pp, status = asyncio.run(normalize(raw, _FakeCfg()))
+        pp, status = _run_async(normalize(raw, _FakeCfg()))
         assert status == "partial"
         assert pp.name == "테스트 상품"
         assert pp.sales_price == 15000
@@ -135,7 +144,7 @@ class TestNormalize:
         mock_anthropic.AsyncAnthropic.return_value = mock_client
 
         with mock.patch.dict("sys.modules", {"anthropic": mock_anthropic}):
-            pp, status = asyncio.run(normalize(raw, _FakeCfg()))
+            pp, status = _run_async(normalize(raw, _FakeCfg()))
 
         assert status == "partial"
         assert pp.name == "테스트 상품"
@@ -171,7 +180,7 @@ class TestNormalize:
 
         # 로컬 'import anthropic' 가 mock을 받도록 sys.modules를 패치
         with mock.patch.dict("sys.modules", {"anthropic": mock_anthropic}):
-            pp, status = asyncio.run(normalize(raw, _FakeCfg()))
+            pp, status = _run_async(normalize(raw, _FakeCfg()))
 
         assert status == "normalized"
         assert pp.brand_name == "테스트 브랜드"
@@ -205,7 +214,7 @@ class TestNormalize:
         mock_anthropic.AsyncAnthropic.return_value = mock_client
 
         with mock.patch.dict("sys.modules", {"anthropic": mock_anthropic}):
-            pp, status = asyncio.run(normalize(raw, _FakeCfg()))
+            pp, status = _run_async(normalize(raw, _FakeCfg()))
 
         assert pp.sales_price == 10000  # raw 값
         assert pp.brand_name == "AI 브랜드"  # AI 허용 필드
@@ -221,6 +230,6 @@ class TestNormalize:
             llm_timeout = 30
             detail_text_limit = 2000
 
-        pp, status = asyncio.run(normalize(raw, _FakeCfg()))
+        pp, status = _run_async(normalize(raw, _FakeCfg()))
         assert "hashtags" in pp.missing_reasons
         assert "usp" in pp.missing_reasons

@@ -24,10 +24,14 @@ def _build_partner_product(
     가격 역전 등 검증 실패 시 problematic 필드를 null로 fallback한다.
     """
     missing = dict(missing_reasons)
-    missing.setdefault(
-        "lowest_price",
-        "시장 최저가 조회 미구현 — Naver 쇼핑 카탈로그 API 연동 필요",
-    )
+
+    # lowest_price는 --lowest-price 플래그로 결정적 추출한 경우에만 채운다.
+    lowest_price: int | None = raw.lowest_price
+    if lowest_price is None:
+        missing.setdefault(
+            "lowest_price",
+            "최저가 미조회 — --lowest-price 플래그로 활성화 가능",
+        )
 
     kwargs: dict[str, Any] = {
         "name": (raw.name or "").strip() or "(상품명 없음)",
@@ -35,7 +39,7 @@ def _build_partner_product(
         "image_url": raw.primary_image_url,
         "consumer_price": raw.consumer_price,
         "sales_price": raw.sales_price,
-        "lowest_price": None,
+        "lowest_price": lowest_price,
         "raw_evidence": raw.raw_evidence,
         "missing_reasons": missing,
         "ai_fields": list(ai_fields_filled),
