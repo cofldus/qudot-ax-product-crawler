@@ -35,6 +35,8 @@ def _print_summary(payload: dict) -> None:
     print(f"  정규화:  {s['total_normalized']}개")
     print(f"  실패:    {s['failed_count']}개")
     print(f"  부분:    {s['partial_count']}개")
+    if s.get("skipped_count"):
+        print(f"  건너뜀:  {s['skipped_count']}개 (증분 재크롤)")
 
     for i, p in enumerate(payload["products"], 1):
         pp = p.get("partner_product") or {}
@@ -72,11 +74,13 @@ async def _run(
     from app.config import settings
     from app.services.crawl_service import run_crawl
 
-    # 런타임 설정 오버라이드
-    settings.enable_lowest_price = lowest_price
-    settings.incremental = incremental
+    # 전역 settings를 변경하지 않고 실행별 복사본을 생성한다
+    run_cfg = settings.model_copy(update={
+        "enable_lowest_price": lowest_price,
+        "incremental": incremental,
+    })
 
-    payload = await run_crawl(url, max_products=max_products)
+    payload = await run_crawl(url, max_products=max_products, cfg=run_cfg)
 
     slug = _store_slug(url)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")

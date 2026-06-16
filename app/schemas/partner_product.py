@@ -46,7 +46,7 @@ class PartnerProductCreateInput(BaseModel):
     sales_price: int | None = Field(None, ge=0, description="판매가 (원)")
 
     # ── 파생 필드 ────────────────────────────────────────────────────
-    lowest_price: int | None = Field(None, ge=0, description="최저가 (미구현, 항상 null)")
+    lowest_price: int | None = Field(None, ge=0, description="최저가 (--lowest-price 활성화 시 실조회, 실패·미활성화 시 null)")
     discount_rate: float | None = Field(None, ge=0.0, le=100.0, description="할인율 (%)")
 
     # ── AI 생성 필드 ─────────────────────────────────────────────────

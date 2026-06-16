@@ -78,6 +78,7 @@ async def run_crawl(
             "total_normalized": total_normalized,
             "failed_count": result.failed_count,
             "partial_count": partial_count,
+            "skipped_count": result.skipped_count,
         },
         "products": product_entries,
         "errors": result.errors,

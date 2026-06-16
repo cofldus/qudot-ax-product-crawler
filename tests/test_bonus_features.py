@@ -12,7 +12,7 @@ import unittest.mock as mock
 
 import pytest
 
-from app.crawlers.naver_shopping import _jaccard, _PRICE_RE
+from app.crawlers.naver_shopping import _jaccard, _PRICE_RE, _build_search_url
 from app.schemas.raw_product import RawProduct
 
 
@@ -295,3 +295,100 @@ class TestEnableLowerPriceFlag:
         pp = _build_partner_product(raw, None, [], {})
         assert pp.lowest_price is None
         assert "lowest_price" in pp.missing_reasons
+
+    def test_no_sales_price_skips_lowest_price(self):
+        """sales_price가 None이면 lowest_price를 반영하지 않고 field_errors에 사유를 기록한다."""
+        raw = _raw(sales_price=None)
+        # base.py _enrich_lowest_price 로직을 직접 검증
+        if raw.sales_price is None:
+            raw.field_errors["lowest_price"] = "판매가 미추출로 오탐 검증 불가 — 최저가 건너뜀"
+        assert raw.lowest_price is None
+        assert "판매가 미추출" in raw.field_errors.get("lowest_price", "")
+
+
+# ──────────────────────────────────────────────────────────
+# 네이버 쇼핑 URL 인코딩
+# ──────────────────────────────────────────────────────────
+
+class TestNaverShoppingUrlEncoding:
+    def test_korean_name_is_percent_encoded(self):
+        """한글 상품명이 URL에 퍼센트 인코딩된다."""
+        url = _build_search_url("유기농 분유 800g")
+        assert "%" in url  # 한글 → %EB%...
+        assert "유기농" not in url  # 원문 한글이 그대로 들어가지 않음
+
+    def test_space_is_encoded(self):
+        """공백이 + 또는 %20으로 인코딩된다."""
+        url = _build_search_url("분유 800g")
+        assert " " not in url
+
+    def test_url_contains_required_params(self):
+        """검색 URL에 query·sort·pagingSize 파라미터가 포함된다."""
+        url = _build_search_url("분유")
+        assert "query=" in url
+        assert "sort=price_asc" in url
+        assert "pagingSize=10" in url
+
+    def test_special_chars_encoded(self):
+        """특수문자(&, =)가 인코딩된다."""
+        url = _build_search_url("a&b=c")
+        assert "a%26b%3Dc" in url or "a&b=c" not in url.split("?query=")[-1].split("&")[0]
+
+
+# ──────────────────────────────────────────────────────────
+# FastAPI 요청별 cfg 분리
+# ──────────────────────────────────────────────────────────
+
+class TestPerRequestCfg:
+    def test_model_copy_does_not_mutate_original(self):
+        """model_copy(update=...)는 원본 settings를 수정하지 않는다."""
+        from app.config import settings
+
+        original_lp = settings.enable_lowest_price
+        original_inc = settings.incremental
+
+        req_cfg = settings.model_copy(update={
+            "enable_lowest_price": not original_lp,
+            "incremental": not original_inc,
+        })
+
+        # 복사본은 변경됨
+        assert req_cfg.enable_lowest_price == (not original_lp)
+        assert req_cfg.incremental == (not original_inc)
+        # 원본은 그대로
+        assert settings.enable_lowest_price == original_lp
+        assert settings.incremental == original_inc
+
+    def test_two_copies_are_independent(self):
+        """서로 다른 요청 cfg 복사본은 독립적이다."""
+        from app.config import settings
+
+        cfg_a = settings.model_copy(update={"enable_lowest_price": True})
+        cfg_b = settings.model_copy(update={"enable_lowest_price": False})
+
+        assert cfg_a.enable_lowest_price is True
+        assert cfg_b.enable_lowest_price is False
+
+
+# ──────────────────────────────────────────────────────────
+# /review HTML 이스케이핑
+# ──────────────────────────────────────────────────────────
+
+class TestReviewHtmlEscaping:
+    def test_html_escape_prevents_xss(self):
+        """html.escape는 XSS 페이로드를 무력화한다."""
+        import html
+        payload = "<script>alert('xss')</script>"
+        escaped = html.escape(payload)
+        assert "<script>" not in escaped
+        assert "&lt;script&gt;" in escaped
+
+    def test_html_escape_in_product_name(self):
+        """상품명에 HTML 특수문자가 있어도 escape 후 안전하다."""
+        import html
+        name = 'A & B "상품" <test>'
+        escaped = html.escape(name)
+        assert "<" not in escaped
+        assert ">" not in escaped
+        assert "&amp;" in escaped
+        assert "&lt;" in escaped

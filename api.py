@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html as _html
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -76,26 +77,34 @@ async def review(limit: int = 50):
         rows = []
 
     def _row_html(r: dict) -> str:
-        name = r.get("name") or ""
-        status = r.get("status") or ""
+        # 모든 문자열 값에 html.escape 적용
+        def esc(v: object) -> str:
+            return _html.escape(str(v)) if v is not None else ""
+
+        name = esc(r.get("name"))
+        status = esc(r.get("status"))
         sp = r.get("sales_price")
+        cp = r.get("consumer_price")
         lp = r.get("lowest_price")
-        img = r.get("image_url") or ""
-        src = r.get("source_url") or ""
-        brand = r.get("brand_name") or ""
-        cat = r.get("category_group") or ""
-        crawled = (r.get("crawled_at") or "")[:19]
-        badge_color = "#2ecc71" if status == "normalized" else "#e67e22"
+        img = esc(r.get("image_url"))
+        src = esc(r.get("source_url"))
+        brand = esc(r.get("brand_name"))
+        cat = esc(r.get("category_group"))
+        crawled = esc((r.get("crawled_at") or "")[:19])
+        badge_color = "#2ecc71" if r.get("status") == "normalized" else "#e67e22"
         img_tag = f'<img src="{img}" style="height:50px;object-fit:contain;" />' if img else "-"
-        src_link = f'<a href="{src}" target="_blank">링크</a>' if src else "-"
+        src_link = f'<a href="{src}" target="_blank" rel="noopener">링크</a>' if src else "-"
         sp_str = f"{sp:,}원" if sp else "-"
+        cp_str = f"{cp:,}원" if cp else "-"
         lp_str = f"{lp:,}원" if lp else "-"
         return (
             f"<tr>"
             f"<td>{img_tag}</td>"
-            f"<td><a href='{src}' target='_blank'>{name[:40]}</a></td>"
-            f"<td><span style='background:{badge_color};color:#fff;padding:2px 6px;border-radius:3px;font-size:11px'>{status}</span></td>"
+            f"<td><a href='{src}' target='_blank' rel='noopener'>{name[:40]}</a></td>"
+            f"<td><span style='background:{badge_color};color:#fff;padding:2px 6px;"
+            f"border-radius:3px;font-size:11px'>{status}</span></td>"
             f"<td>{sp_str}</td>"
+            f"<td>{cp_str}</td>"
             f"<td>{lp_str}</td>"
             f"<td>{brand}</td>"
             f"<td>{cat}</td>"
@@ -104,7 +113,7 @@ async def review(limit: int = 50):
         )
 
     rows_html = "\n".join(_row_html(r) for r in rows) if rows else (
-        "<tr><td colspan='8' style='text-align:center;color:#888'>데이터 없음</td></tr>"
+        "<tr><td colspan='9' style='text-align:center;color:#888'>데이터 없음</td></tr>"
     )
 
     html = f"""<!DOCTYPE html>
@@ -127,15 +136,15 @@ async def review(limit: int = 50):
 <body>
 <header>
   <h1>Qudot AX — 파트너 상품 검수</h1>
-  <div class="meta">최근 {limit}건 / <a href="/products" style="color:#7ec8e3">JSON API</a></div>
+  <div class="meta">최근 {_html.escape(str(limit))}건 / <a href="/products" style="color:#7ec8e3">JSON API</a></div>
 </header>
 <main>
 <table>
   <thead>
     <tr>
       <th>이미지</th><th>상품명</th><th>상태</th>
-      <th>판매가</th><th>최저가</th><th>브랜드</th>
-      <th>카테고리</th><th>수집일시</th>
+      <th>판매가</th><th>정가</th><th>최저가</th>
+      <th>브랜드</th><th>카테고리</th><th>수집일시</th>
     </tr>
   </thead>
   <tbody>
@@ -161,9 +170,11 @@ async def crawl(req: CrawlRequest) -> dict[str, Any]:
     try:
         from app.config import settings
         from app.services.crawl_service import run_crawl
-        # 요청별 런타임 플래그 오버라이드
-        settings.enable_lowest_price = req.lowest_price
-        settings.incremental = req.incremental
-        return await run_crawl(req.url, max_products=req.max_products)
+        # 전역 settings를 변경하지 않고 요청별 복사본을 생성한다
+        req_cfg = settings.model_copy(update={
+            "enable_lowest_price": req.lowest_price,
+            "incremental": req.incremental,
+        })
+        return await run_crawl(req.url, max_products=req.max_products, cfg=req_cfg)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))

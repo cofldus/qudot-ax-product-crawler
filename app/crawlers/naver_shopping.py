@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import re
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlencode
 
 from playwright.async_api import Page
 
@@ -38,6 +39,12 @@ def _jaccard(a: str, b: str) -> float:
     return len(ta & tb) / len(ta | tb)
 
 
+def _build_search_url(product_name: str) -> str:
+    """검색 URL을 urlencode로 안전하게 생성한다 (한글 등 특수문자 처리)."""
+    params = {"query": product_name, "sort": "price_asc", "pagingSize": "10"}
+    return "https://search.shopping.naver.com/search/all?" + urlencode(params)
+
+
 async def fetch_lowest_price(
     product_name: str,
     page: Page,
@@ -69,10 +76,7 @@ async def fetch_lowest_price(
         return None
 
     query = product_name.strip()[:40]
-    search_url = (
-        "https://search.shopping.naver.com/search/all"
-        f"?query={query}&sort=price_asc&pagingSize=10"
-    )
+    search_url = _build_search_url(query)
 
     try:
         await page.goto(search_url, wait_until="networkidle", timeout=timeout)

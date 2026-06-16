@@ -23,6 +23,7 @@ class CrawlResult:
     products: list[RawProduct] = field(default_factory=list)
     errors: list[dict[str, str]] = field(default_factory=list)
     discovered_count: int = 0
+    skipped_count: int = 0  # 증분 재크롤로 건너뛴 URL 수
 
     @property
     def success_count(self) -> int:
@@ -132,14 +133,13 @@ class BaseCrawler(ABC):
                 # 증분 재크롤 — 최근 24h 이내 수집한 URL은 건너뜀
                 if self.cfg.incremental and self.cfg.supabase_url:
                     if await self._is_recently_crawled(url):
+                        result.skipped_count += 1
                         continue
 
                 raw = await self._extract_with_retry(page, url)
 
-                # 자가복구 — 결정적 추출 실패 시 LLM으로 재분석
-                if self.cfg.enable_recovery and (
-                    raw.name is None or raw.sales_price is None
-                ):
+                # 옵션 보조 분석 — 크롤 성공 후 option_texts가 없을 때만 LLM으로 보완
+                if self.cfg.enable_recovery and not raw.crawl_error and not raw.option_texts:
                     try:
                         body_text = await page.evaluate("() => document.body.innerText")
                         from app.ai.recovery import recover_missing_fields
@@ -187,9 +187,15 @@ class BaseCrawler(ABC):
     async def _enrich_lowest_price(self, raw: RawProduct) -> None:
         """별도 페이지에서 네이버 쇼핑 최저가를 조회해 raw에 기록한다.
 
-        - 결과가 None이면 (오탐·미검출) lowest_price는 null로 유지하고 사유를 기록한다.
-        - lowest_price가 sales_price보다 비정상적으로 낮으면 (10% 미만) 반영하지 않는다.
+        오탐 방지 3단계:
+        1. sales_price 미추출 시 → 비교 기준 없음, 즉시 중단
+        2. 유사도 < 0.35 → 다른 상품 검색 결과로 판단, None 반환
+        3. lowest_price < sales_price × 0.1 → 비정상 저가, 반영 안 함
         """
+        if raw.sales_price is None:
+            raw.field_errors["lowest_price"] = "판매가 미추출로 오탐 검증 불가 — 최저가 건너뜀"
+            return
+
         shopping_page = await self._context.new_page()
         try:
             from app.crawlers.naver_shopping import fetch_lowest_price
@@ -197,7 +203,7 @@ class BaseCrawler(ABC):
             if result:
                 lp = result["price"]
                 # 판매가 대비 비정상적으로 낮은 최저가는 오탐으로 간주
-                if raw.sales_price and lp < raw.sales_price * 0.1:
+                if lp < raw.sales_price * 0.1:
                     raw.field_errors["lowest_price"] = (
                         f"최저가({lp:,}원)가 판매가({raw.sales_price:,}원) 대비 10% 미만 — 오탐 제외"
                     )
