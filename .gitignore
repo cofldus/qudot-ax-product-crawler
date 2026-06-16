@@ -38,6 +38,8 @@ Thumbs.db
 
 # 수집 결과 — 샘플만 유지
 outputs/*.json
+outputs/*.png
+outputs/*.jpg
 !outputs/.gitkeep
 !outputs/sample_*.json
 
